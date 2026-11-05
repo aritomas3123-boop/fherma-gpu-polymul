@@ -606,6 +606,132 @@ inline cudaError_t transform(uint32_t *a, uint32_t *b, const ari::Prime *primes,
 #include <memory>
 #include <stdexcept>
 #include <string>
+
+#include <cstdint>
+#include <vector>
+
+namespace ari_shoup {
+struct Weight { uint32_t value, quotient; };
+inline Weight make_weight(uint32_t value, uint32_t p) {
+    return {value, uint32_t((uint64_t(value) << 32) / p)};
+}
+// W_j = 2^(32*(j+1)) mod p. The extra common factor is Montgomery R.
+inline std::vector<Weight> make_weights(const std::vector<ari::Prime> &ps, unsigned limbs) {
+    std::vector<Weight> w(std::size_t(ps.size()) * limbs);
+    for (std::size_t k = 0; k < ps.size(); ++k) {
+        uint32_t factor = ps[k].one;
+        for (unsigned j = 0; j < limbs; ++j) {
+            w[k * limbs + j] = make_weight(factor, ps[k].p);
+            factor = uint32_t(uint64_t(factor) * ps[k].one % ps[k].p);
+        }
+    }
+    return w;
+}
+FHD inline uint32_t lazy_product(uint32_t limb, Weight w, uint32_t p) {
+    // For any limb < 2^32 the approximate quotient underestimates the true
+    // quotient by at most 1. The exact residual is < 2p < 2^32.
+#ifdef __CUDA_ARCH__
+    uint32_t quotient = __umulhi(limb, w.quotient);
+#else
+    uint32_t quotient = uint32_t((uint64_t(limb) * w.quotient) >> 32);
+#endif
+    return limb * w.value - quotient * p;
+}
+FHD inline uint32_t canonical_word(uint32_t x, uint32_t p) {
+    if (x >= p) x -= p;
+    if (x >= p) x -= p;
+    if (x >= p) x -= p;
+    return x;
+}
+FHD inline uint32_t finish(uint64_t sum, Weight radix, uint32_t p) {
+    uint32_t lo = canonical_word(uint32_t(sum), p);
+    uint32_t hi = lazy_product(uint32_t(sum >> 32), radix, p);
+    if (hi >= p) hi -= p;
+    return ari::add(lo, hi, p);
+}
+FHD inline uint32_t convert(const uint32_t *input, const Weight *w, unsigned limbs, uint32_t p) {
+    uint64_t sum = 0;
+    for (unsigned j = 0; j < limbs; ++j) sum += lazy_product(input[j], w[j], p);
+    return finish(sum, w[0], p);
+}
+// Same arithmetic with two input arrays, to interleave independent GPU instruction chains.
+FHD inline void convert_both(const uint32_t *a, const uint32_t *b,
+                             const Weight *w, unsigned limbs, uint32_t p,
+                             uint32_t &x, uint32_t &y) {
+    uint64_t sa=0, sb=0;
+    for (unsigned j=0;j<limbs;++j) {
+        Weight t=w[j];
+        sa+=lazy_product(a[j],t,p);
+        sb+=lazy_product(b[j],t,p);
+    }
+    x=finish(sa,w[0],p); y=finish(sb,w[0],p);
+}
+} // namespace ari_shoup
+#include <cuda_runtime.h>
+namespace ari_shoup {
+constexpr unsigned warp_size = 32, reindex_rows = 8, group_primes = 8;
+// Bit reversal is an involution. A single warp owns each pair (i,r) with
+// r>i, and lane j swaps one word of that pair; no block shares any address.
+__global__ void reindex(uint32_t *a,uint32_t *b,unsigned n,unsigned l,unsigned bits) {
+    const unsigned i=blockIdx.x*reindex_rows+threadIdx.y;
+    if(i>=n)return;
+    const unsigned r=__brev(i)>>(32-bits);
+    if(r<=i)return;
+    for(unsigned j=threadIdx.x;j<l;j+=warp_size) {
+        auto u=std::size_t(i)*l+j,v=std::size_t(r)*l+j;
+        uint32_t ai=a[u],ar=a[v],bi=b[u],br=b[v];
+        a[u]=ar;a[v]=ai;b[u]=br;b[v]=bi;
+    }
+}
+// Per block: 32 adjacent bit-reversed positions and 8 primes. Once the input
+// tile has been staged, advancing through its words uses a conflict-free odd
+// stride. Twists are permuted at setup, solely from point parameters.
+__global__ void encode_tiled(const uint32_t *ar,const uint32_t *br,uint32_t *ra,uint32_t *rb,
+                             const ari::Prime *primes,const Weight *weights,
+                             const uint32_t *reversed_twist,unsigned n,unsigned l,unsigned count) {
+    extern __shared__ uint32_t stage[];
+    const unsigned stride=l|1u;
+    uint32_t *sa=stage, *sb=stage+warp_size*stride;
+    const unsigned x=threadIdx.x,y=threadIdx.y;
+    const unsigned start=blockIdx.x*warp_size;
+    const unsigned valid=(n-start<warp_size)?n-start:warp_size;
+    for(unsigned t=y*warp_size+x;t<valid*l;t+=warp_size*group_primes) {
+        unsigned row=t/l,col=t-row*l;
+        std::size_t off=std::size_t(start)*l+t;
+        sa[row*stride+col]=ar[off]; sb[row*stride+col]=br[off];
+    }
+    __syncthreads();
+    const unsigned k=blockIdx.y*group_primes+y;
+    if(k>=count||x>=valid)return;
+    const auto p=primes[k];
+    const std::size_t off=std::size_t(k)*n+start+x;
+    uint32_t a,b;
+    convert_both(sa+x*stride,sb+x*stride,weights+std::size_t(k)*l,l,p.p,a,b);
+    uint32_t twist=reversed_twist[off];
+    ra[off]=ari::mont(a,twist,p);
+    rb[off]=ari::mont(b,twist,p);
+}
+inline std::vector<uint32_t> reorder_twists(const std::vector<uint32_t>& tw,
+                                             unsigned n,unsigned bits) {
+    std::vector<uint32_t> ret(tw.size());
+    for(std::size_t base=0;base<tw.size();base+=n)
+        for(unsigned i=0;i<n;++i)ret[base+ari::reverse_bits(i,bits)]=tw[base+i];
+    return ret;
+}
+inline cudaError_t launch(uint32_t *a,uint32_t *b,
+                          uint32_t *ra,uint32_t *rb,const ari::Prime *ps,const Weight *weights,
+                          const uint32_t *twist_reversed,unsigned n,unsigned l,unsigned bits,
+                          unsigned count,cudaStream_t stream=nullptr) {
+    if(n<2||n>65536||(n&(n-1))||!l||l>55||!count) return cudaErrorInvalidValue;
+    reindex<<<(n+reindex_rows-1)/reindex_rows,dim3(warp_size,reindex_rows),0,stream>>>(a,b,n,l,bits);
+    cudaError_t st=cudaGetLastError();
+    if(st!=cudaSuccess)return st;
+    size_t shared_bytes=2*warp_size*(l|1u)*sizeof(uint32_t);
+    encode_tiled<<<dim3((n+warp_size-1)/warp_size,(count+group_primes-1)/group_primes),
+        dim3(warp_size,group_primes),shared_bytes,stream>>>(a,b,ra,rb,ps,weights,twist_reversed,n,l,count);
+    return cudaGetLastError();
+}
+} // namespace ari_shoup
 #ifndef FHERMA_NTT_TILED
 #define FHERMA_NTT_TILED 1
 #endif
@@ -621,17 +747,6 @@ template<class T> struct Buffer {
     void alloc(size_t n){check(cudaMalloc(reinterpret_cast<void**>(&ptr),n*sizeof(T)),"cudaMalloc");}
     void copy(const std::vector<T>& x){alloc(x.size());check(cudaMemcpy(ptr,x.data(),x.size()*sizeof(T),cudaMemcpyHostToDevice),"setup upload");}
 };
-__global__ void encode(const uint32_t* a,const uint32_t* b,uint32_t* ra,uint32_t* rb,
-                       const ari::Prime* primes,const uint32_t* twist,unsigned N,unsigned L,unsigned logN) {
-    const unsigned i=blockIdx.x*blockDim.x+threadIdx.x,k=blockIdx.y;
-    if(i>=N)return;
-    const auto p=primes[k];
-    const uint32_t x=ari::mont(ari::reduce_coefficient(a+size_t(i)*L,L,p),p.r2,p);
-    const uint32_t y=ari::mont(ari::reduce_coefficient(b+size_t(i)*L,L,p),p.r2,p);
-    const size_t at=size_t(k)*N+ari::reverse_bits(i,logN);
-    ra[at]=ari::mont(x,twist[size_t(k)*N+i],p);
-    rb[at]=ari::mont(y,twist[size_t(k)*N+i],p);
-}
 #if !FHERMA_NTT_TILED
 __global__ void forward_stage(uint32_t* a,uint32_t* b,const ari::Prime* primes,
                               const uint32_t* roots,unsigned N,unsigned half) {
@@ -668,6 +783,7 @@ struct State {
     ari::Plan plan;
     Buffer<uint32_t> a,b,c,ra,rb,rc,roots,inverse_roots,twist,untwist;
     Buffer<ari::Prime> primes;
+    Buffer<ari_shoup::Weight> weights;
     std::unique_ptr<fherma_crt::DevicePlan> crt;
     explicit State(const fherma::Point& p):plan(p){}
 };
@@ -678,8 +794,9 @@ void* fherma_init(const fherma::Point& p) {
     const size_t words=size_t(p.N)*p.L, residues=size_t(p.N)*s->plan.K;
     s->a.alloc(words);s->b.alloc(words);s->c.alloc(words);
     s->ra.alloc(residues);s->rb.alloc(residues);s->rc.alloc(residues);
+    s->weights.copy(ari_shoup::make_weights(s->plan.primes,p.L));
     s->primes.copy(s->plan.primes);s->roots.copy(s->plan.roots);
-    s->inverse_roots.copy(s->plan.inverse_roots);s->twist.copy(s->plan.twist);s->untwist.copy(s->plan.untwist);
+    s->inverse_roots.copy(s->plan.inverse_roots);s->twist.copy(ari_shoup::reorder_twists(s->plan.twist,p.N,s->plan.logN));s->untwist.copy(s->plan.untwist);
     std::vector<uint32_t> primes;for(auto prime:s->plan.primes)primes.push_back(prime.p);
     s->crt=std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes);
     check(cudaDeviceSynchronize(),"initialize GPU");
@@ -696,8 +813,8 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
 #if !FHERMA_NTT_TILED
     const dim3 butterflies((p.N/2+255)/256,p.K);
 #endif
-    encode<<<grid,256>>>(s.a.ptr,s.b.ptr,s.ra.ptr,s.rb.ptr,s.primes.ptr,s.twist.ptr,p.N,p.L,p.logN);
-    check(cudaGetLastError(),"encode launch");
+    check(ari_shoup::launch(s.a.ptr,s.b.ptr,s.ra.ptr,s.rb.ptr,s.primes.ptr,s.weights.ptr,
+          s.twist.ptr,p.N,p.L,p.logN,p.K),"encode Shoup");
 #if FHERMA_NTT_TILED
     check(ari_tile::transform<true>(s.ra.ptr,s.rb.ptr,s.primes.ptr,s.roots.ptr,p.N,p.K),"tiled forward NTT");
 #else
