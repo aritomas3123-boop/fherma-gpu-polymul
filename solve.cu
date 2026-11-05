@@ -1041,6 +1041,166 @@ public:
 #include <cstdio>
 #include <system_error>
 
+// BEGIN STAGING DIAGNOSTIC GLOBAL HELPER
+// Diagnostic helper: include only at GLOBAL scope after cuda_runtime.h.
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+#if defined(__linux__)
+#include <sched.h>
+#endif
+#ifndef FHERMA_STAGING_DIAGNOSTIC
+#define FHERMA_STAGING_DIAGNOSTIC 1
+#endif
+#if FHERMA_STAGING_DIAGNOSTIC
+namespace ari_staging_profile {
+using Clock=std::chrono::steady_clock;
+inline double ms(Clock::duration value){return std::chrono::duration<double,std::milli>(value).count();}
+enum Cpu : unsigned {CopyA,EnqueueA,CopyB,EnqueueB,JoinComputeAPI,
+    DownloadAPI,ResizeC,FinalWait,CopyC,BeforeCapture,CpuCount};
+constexpr unsigned capacity=128,event_count=25,gpu_count=23;
+constexpr unsigned operand_origin(unsigned operand){return operand*7;}
+constexpr unsigned input_begin(unsigned operand){return operand_origin(operand)+1;}
+constexpr unsigned joined=14,pointwise_begin=15,inverse_begin=17,
+    decode_begin=19,crt_begin=21,download_begin=23;
+struct Sample {
+    std::array<double,CpuCount> cpu{};
+    std::array<double,gpu_count> gpu{};
+};
+struct CpuContext {
+    std::string membership="unknown",path="/sys/fs/cgroup",quota="unavailable",allowed="unknown";
+    long long usage=-1,periods=-1,throttled=-1,throttled_us=-1;
+    int allowed_count=-1,current_cpu=-1;
+};
+inline void parse_stat(std::istream& input,CpuContext& row){
+    std::string name;long long value;
+    while(input>>name>>value){
+        if(name=="usage_usec")row.usage=value;
+        else if(name=="nr_periods")row.periods=value;
+        else if(name=="nr_throttled")row.throttled=value;
+        else if(name=="throttled_usec")row.throttled_us=value;
+    }
+}
+// Called only after setup calibration and in fherma_free, never in fherma_run.
+// The fallback path may be a container-visible ancestor; its exact path is logged.
+inline CpuContext cpu_context(){
+    CpuContext row;
+#if defined(__linux__)
+    std::ifstream membership("/proc/self/cgroup");std::string line;
+    while(std::getline(membership,line))if(line.rfind("0::",0)==0){row.membership=line.substr(3);break;}
+    if(!row.membership.empty() && row.membership[0]=='/' && row.membership!="/"){
+        const std::string candidate="/sys/fs/cgroup"+row.membership;
+        std::ifstream test(candidate+"/cpu.stat");if(test)row.path=candidate;
+    }
+    std::ifstream quota(row.path+"/cpu.max");if(quota)std::getline(quota,row.quota);
+    std::ifstream stat(row.path+"/cpu.stat");parse_stat(stat,row);
+    cpu_set_t set;CPU_ZERO(&set);
+    if(sched_getaffinity(0,sizeof(set),&set)==0){
+        row.allowed_count=CPU_COUNT(&set);row.allowed.clear();
+        for(int cpu=0;cpu<CPU_SETSIZE;++cpu)if(CPU_ISSET(cpu,&set)){
+            if(!row.allowed.empty())row.allowed+=',';
+            row.allowed+=std::to_string(cpu);
+        }
+    }
+    row.current_cpu=sched_getcpu();
+#endif
+    return row;
+}
+class Profile {
+    std::array<cudaEvent_t,event_count> events_{};
+    std::vector<Sample> calls_;
+    CpuContext initial_;
+    bool context_started_=false;
+    static void checked(cudaError_t status,const char* where){
+        if(status!=cudaSuccess)throw std::runtime_error(std::string(where)+": "+cudaGetErrorString(status));
+    }
+    void release() noexcept {for(auto event:events_)if(event)cudaEventDestroy(event);}
+    double elapsed(unsigned begin,unsigned end) const {
+        float value=0;checked(cudaEventElapsedTime(&value,events_[begin],events_[end]),"read staging diagnostic interval");return value;
+    }
+public:
+    Profile(){
+        calls_.reserve(capacity);
+        try{for(auto& event:events_)checked(cudaEventCreate(&event),"create staging diagnostic event");}
+        catch(...){release();throw;}
+    }
+    ~Profile(){release();}
+    Profile(const Profile&)=delete;
+    void begin_context() noexcept {
+        try{initial_=cpu_context();context_started_=true;}catch(...){context_started_=false;}
+    }
+    void mark(unsigned event,cudaStream_t stream){
+        checked(cudaEventRecord(events_[event],stream),"record staging diagnostic event");
+    }
+    // Only after the ORIGINAL RunFence AND final CPU output copy have completed.
+    // Cross-stream pairs below have a causal edge through the existing A join.
+    // Separate A/B origins are never compared with max() or treated as makespan.
+    void capture(Sample sample){
+        if(calls_.size()>=capacity)return;
+        unsigned col=0;
+        for(unsigned operand=0;operand<2;++operand){
+            const unsigned first=input_begin(operand);
+            for(unsigned phase=0;phase<3;++phase)
+                sample.gpu[col++]=elapsed(first+2*phase,first+2*phase+1);
+        }
+        for(unsigned first:{pointwise_begin,inverse_begin,decode_begin,crt_begin,download_begin})
+            sample.gpu[col++]=elapsed(first,first+1);
+        sample.gpu[col++]=elapsed(0,1);sample.gpu[col++]=elapsed(0,6);
+        sample.gpu[col++]=elapsed(7,8);sample.gpu[col++]=elapsed(7,13);
+        for(unsigned end:{joined,16u,18u,20u,22u,24u})sample.gpu[col++]=elapsed(0,end);
+        sample.gpu[col++]=elapsed(6,joined);sample.gpu[col++]=elapsed(13,joined);
+        calls_.push_back(sample);
+    }
+    void report(unsigned n,unsigned w) const noexcept {
+        try{
+            const auto final=cpu_context();
+            auto delta=[](long long before,long long after){return before>=0&&after>=before?after-before:-1;};
+            std::fprintf(stderr,"ARI_STAGING_CONTEXT N=%u W=%u cgroup_v2=%s path=%s cpu_max_setup=%s cpu_max_free=%s "
+                "allowed_setup=%d allowed_free=%d current_setup=%d current_free=%d allowed_list_setup=%s allowed_list_free=%s "
+                "interval_includes_harness=1 context_started=%d usage_usec_delta=%lld nr_periods_delta=%lld "
+                "nr_throttled_delta=%lld throttled_usec_delta=%lld\n",n,w,final.membership.c_str(),final.path.c_str(),
+                initial_.quota.c_str(),final.quota.c_str(),initial_.allowed_count,final.allowed_count,
+                initial_.current_cpu,final.current_cpu,initial_.allowed.c_str(),final.allowed.c_str(),int(context_started_),
+                delta(initial_.usage,final.usage),delta(initial_.periods,final.periods),
+                delta(initial_.throttled,final.throttled),delta(initial_.throttled_us,final.throttled_us));
+            if(calls_.empty())return;
+            std::array<double,capacity> values{};
+            auto print=[&](const char* name,auto get){
+                unsigned used=0;for(const auto& row:calls_){const double value=get(row);if(value>=0&&std::isfinite(value))values[used++]=value;}
+                if(!used){std::fprintf(stderr," %s=NA",name);return;}
+                std::sort(values.begin(),values.begin()+used);
+                std::fprintf(stderr," %s=%.6f",name,(values[(used-1)/2]+values[used/2])*0.5);
+            };
+            const char* cpu_names[]={"copy_A","enqueue_A","copy_B","enqueue_B","join_compute_API",
+                "download_API","resize_C","final_wait","copy_C","before_capture"};
+            const char* gpu_names[]={"A_H2D_span","A_encode_span","A_forward_span","B_H2D_span","B_encode_span","B_forward_span",
+                "pointwise_span","inverse_span","decode_span","CRT_span","D2H_span",
+                "A_H2D_start_from_A_origin","A_forward_from_A_origin","B_H2D_start_from_B_origin","B_forward_from_B_origin",
+                "join_from_A_origin","pointwise_from_A_origin","inverse_from_A_origin","decode_from_A_origin",
+                "CRT_from_A_origin","D2H_done_from_A_origin","A_ready_to_join","B_ready_to_join"};
+            std::fprintf(stderr,"ARI_STAGING_CPU N=%u W=%u calls=%zu median_ms",n,w,calls_.size());
+            for(unsigned col=0;col<CpuCount;++col)print(cpu_names[col],[col](const Sample& row){return row.cpu[col];});
+            std::fprintf(stderr,"\nARI_STAGING_GPU N=%u W=%u calls=%zu median_ms",n,w,calls_.size());
+            for(unsigned col=0;col<gpu_count;++col)print(gpu_names[col],[col](const Sample& row){return row.gpu[col];});
+            std::fprintf(stderr,"\nARI_STAGING_NOTE N=%u W=%u warmups_included=1 diagnostic_only=1 capacity=%u "
+                "capture_after_final_CPU_copy=1 no_added_waits=1 do_not_sum_stage_medians=1 "
+                "A_B_origins_differ=1 capture_GPU_queries_excluded_from_before_capture=1\n",n,w,capacity);
+            std::fflush(stderr);
+        }catch(...){std::fprintf(stderr,"ARI_STAGING_CONTEXT reporting_failed=1\n");}
+    }
+};
+} // namespace ari_staging_profile
+#endif
+
+// END STAGING DIAGNOSTIC GLOBAL HELPER
+
 namespace {
 void check(cudaError_t e,const char* where) {
     if(e!=cudaSuccess) throw std::runtime_error(std::string(where)+": "+cudaGetErrorString(e));
@@ -1136,6 +1296,10 @@ struct State {
     HostBuffer<uint32_t> host_c;
 #endif
     std::unique_ptr<fherma_crt::DevicePlan> crt;
+#if FHERMA_STAGING_DIAGNOSTIC
+    ari_staging_profile::Profile profile;
+    ~State(){profile.report(plan.N,plan.W);}
+#endif // FHERMA_STAGING_DIAGNOSTIC
     explicit State(const fherma::Point& p):plan(p){}
 };
 // Calibration touches only owned, synthetic point-sized storage. All runtime
@@ -1231,6 +1395,9 @@ void* fherma_init(const fherma::Point& p) {
     s->crt=std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes);
     check(cudaDeviceSynchronize(),"initialize GPU");
     choose_staging(*s,words);
+#if FHERMA_STAGING_DIAGNOSTIC
+    s->profile.begin_context();
+#endif // FHERMA_STAGING_DIAGNOSTIC
     return s.release();
 }
 
@@ -1238,6 +1405,10 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     auto& s=*static_cast<State*>(state);const auto& p=s.plan;
     const size_t words=size_t(p.N)*p.L,bytes=words*sizeof(uint32_t);
     if(in.a.data.size()!=words||in.b.data.size()!=words)throw std::runtime_error("input size does not match point");
+#if FHERMA_STAGING_DIAGNOSTIC
+    ari_staging_profile::Sample diagnostic;
+    const auto diagnostic_start=ari_staging_profile::Clock::now();
+#endif // FHERMA_STAGING_DIAGNOSTIC
     RunFence fence(s.stream_a.handle);
     const dim3 grid((p.N+255)/256,p.K);
 #if !FHERMA_NTT_TILED
@@ -1248,13 +1419,34 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
         uint32_t* residues=operand?s.rb.ptr:s.ra.ptr;
 #if FHERMA_PINNED_INPUT
         uint32_t* stage=operand?s.host_b.ptr:s.host_a.ptr;
+#if FHERMA_STAGING_DIAGNOSTIC
+        s.profile.mark(ari_staging_profile::operand_origin(operand),stream);
+        const auto copy_start=ari_staging_profile::Clock::now();
+#endif // FHERMA_STAGING_DIAGNOSTIC
         s.copy_team->copy(stage,input,words,s.input_wc);
+#if FHERMA_STAGING_DIAGNOSTIC
+        diagnostic.cpu[operand?ari_staging_profile::CopyB:ari_staging_profile::CopyA]=
+            ari_staging_profile::ms(ari_staging_profile::Clock::now()-copy_start);
+#endif // FHERMA_STAGING_DIAGNOSTIC
         input=stage;
 #endif
+#if FHERMA_STAGING_DIAGNOSTIC
+        const auto enqueue_start=ari_staging_profile::Clock::now();
+        const auto input_event=ari_staging_profile::input_begin(operand);
+        s.profile.mark(input_event,stream);
+#endif // FHERMA_STAGING_DIAGNOSTIC
         check(cudaMemcpyAsync(device,input,bytes,cudaMemcpyHostToDevice,stream),"upload operand");
+#if FHERMA_STAGING_DIAGNOSTIC
+        s.profile.mark(input_event+1,stream);
+        s.profile.mark(input_event+2,stream);
+#endif // FHERMA_STAGING_DIAGNOSTIC
         check(ari_wmma_encoder::launch_operand(device,residues,operand,s.packed_inputs.ptr,
             s.packed_weights.ptr,s.primes.ptr,s.radix.ptr,s.twist.ptr,
             p.N,p.L,p.logN,p.K,stream),"encode operand");
+#if FHERMA_STAGING_DIAGNOSTIC
+        s.profile.mark(input_event+3,stream);
+        s.profile.mark(input_event+4,stream);
+#endif // FHERMA_STAGING_DIAGNOSTIC
 #if FHERMA_NTT_TILED
         // The template selects the number of arrays. The roots select direction.
         check(ari_tile::transform<false>(residues,nullptr,s.primes.ptr,s.roots.ptr,
@@ -1265,14 +1457,30 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
             check(cudaGetLastError(),"single-operand forward stage");
         }
 #endif
+#if FHERMA_STAGING_DIAGNOSTIC
+        s.profile.mark(input_event+5,stream);
+        diagnostic.cpu[operand?ari_staging_profile::EnqueueB:ari_staging_profile::EnqueueA]=
+            ari_staging_profile::ms(ari_staging_profile::Clock::now()-enqueue_start);
+#endif // FHERMA_STAGING_DIAGNOSTIC
     };
     submit_operand(0,in.a.data.data(),s.stream_a.handle);
     check(cudaEventRecord(s.forward_a.handle,s.stream_a.handle),"mark A transform complete");
     // This CPU staging copy and the B upload may overlap A's encoder/NTT.
     submit_operand(1,in.b.data.data(),nullptr);
+#if FHERMA_STAGING_DIAGNOSTIC
+    const auto compute_enqueue_start=ari_staging_profile::Clock::now();
+#endif // FHERMA_STAGING_DIAGNOSTIC
     check(cudaStreamWaitEvent(nullptr,s.forward_a.handle,0),"join A and B before product");
+#if FHERMA_STAGING_DIAGNOSTIC
+    s.profile.mark(ari_staging_profile::joined,nullptr);
+    s.profile.mark(ari_staging_profile::pointwise_begin,nullptr);
+#endif // FHERMA_STAGING_DIAGNOSTIC
     multiply_reverse<<<grid,256>>>(s.ra.ptr,s.rb.ptr,s.rc.ptr,s.primes.ptr,p.N,p.logN);
     check(cudaGetLastError(),"multiply launch");
+#if FHERMA_STAGING_DIAGNOSTIC
+    s.profile.mark(ari_staging_profile::pointwise_begin+1,nullptr);
+    s.profile.mark(ari_staging_profile::inverse_begin,nullptr);
+#endif // FHERMA_STAGING_DIAGNOSTIC
 #if FHERMA_NTT_TILED
     check(ari_tile::transform<false>(s.rc.ptr,nullptr,s.primes.ptr,s.inverse_roots.ptr,p.N,p.K),"tiled inverse NTT");
 #else
@@ -1281,16 +1489,52 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
         check(cudaGetLastError(),"inverse NTT launch");
     }
 #endif
+#if FHERMA_STAGING_DIAGNOSTIC
+    s.profile.mark(ari_staging_profile::inverse_begin+1,nullptr);
+    s.profile.mark(ari_staging_profile::decode_begin,nullptr);
+#endif // FHERMA_STAGING_DIAGNOSTIC
     decode<<<grid,256>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
     check(cudaGetLastError(),"decode launch");
+#if FHERMA_STAGING_DIAGNOSTIC
+    s.profile.mark(ari_staging_profile::decode_begin+1,nullptr);
+    s.profile.mark(ari_staging_profile::crt_begin,nullptr);
+#endif // FHERMA_STAGING_DIAGNOSTIC
     check(s.crt->run(s.rc.ptr,s.c.ptr),"CRT launch");
+#if FHERMA_STAGING_DIAGNOSTIC
+    s.profile.mark(ari_staging_profile::crt_begin+1,nullptr);
+    diagnostic.cpu[ari_staging_profile::JoinComputeAPI]=
+        ari_staging_profile::ms(ari_staging_profile::Clock::now()-compute_enqueue_start);
+#endif // FHERMA_STAGING_DIAGNOSTIC
     fherma::Outputs out;out.c.shape={int64_t(p.N),int64_t(p.L)};
 #if FHERMA_PINNED_OUTPUT
+#if FHERMA_STAGING_DIAGNOSTIC
+    const auto download_enqueue_start=ari_staging_profile::Clock::now();
+    s.profile.mark(ari_staging_profile::download_begin,nullptr);
+#endif // FHERMA_STAGING_DIAGNOSTIC
     check(cudaMemcpyAsync(s.host_c.ptr,s.c.ptr,bytes,cudaMemcpyDeviceToHost,nullptr),"download staged result");
+#if FHERMA_STAGING_DIAGNOSTIC
+    s.profile.mark(ari_staging_profile::download_begin+1,nullptr);
+    diagnostic.cpu[ari_staging_profile::DownloadAPI]=
+        ari_staging_profile::ms(ari_staging_profile::Clock::now()-download_enqueue_start);
+    const auto resize_start=ari_staging_profile::Clock::now();
+#endif // FHERMA_STAGING_DIAGNOSTIC
     // Construct elements while D2H and preceding kernels can still run.
     out.c.data.resize(words);
+#if FHERMA_STAGING_DIAGNOSTIC
+    diagnostic.cpu[ari_staging_profile::ResizeC]=ari_staging_profile::ms(ari_staging_profile::Clock::now()-resize_start);
+    const auto final_wait_start=ari_staging_profile::Clock::now();
+#endif // FHERMA_STAGING_DIAGNOSTIC
     fence.complete();
+#if FHERMA_STAGING_DIAGNOSTIC
+    diagnostic.cpu[ari_staging_profile::FinalWait]=ari_staging_profile::ms(ari_staging_profile::Clock::now()-final_wait_start);
+    const auto final_copy_start=ari_staging_profile::Clock::now();
+#endif // FHERMA_STAGING_DIAGNOSTIC
     s.copy_team->copy(out.c.data.data(),s.host_c.ptr,words);
+#if FHERMA_STAGING_DIAGNOSTIC
+    diagnostic.cpu[ari_staging_profile::CopyC]=ari_staging_profile::ms(ari_staging_profile::Clock::now()-final_copy_start);
+    diagnostic.cpu[ari_staging_profile::BeforeCapture]=ari_staging_profile::ms(ari_staging_profile::Clock::now()-diagnostic_start);
+    s.profile.capture(diagnostic);
+#endif // FHERMA_STAGING_DIAGNOSTIC
 #else
     out.c.data.resize(words);
     check(cudaMemcpy(out.c.data.data(),s.c.ptr,bytes,cudaMemcpyDeviceToHost),"download result");
