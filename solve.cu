@@ -742,6 +742,187 @@ inline cudaError_t launch(uint32_t *a,uint32_t *b,
     return cudaGetLastError();
 }
 } // namespace ari_shoup
+#include <cstdint>
+#include <vector>
+
+// WMMA B is column-major in each 16x16 panel. Columns are RNS primes.
+// The host writes only the active values; zero-filled padding contributes
+// nothing to the dot products on the final prime and limb tiles.
+namespace ari_encoder_setup {
+struct Weights {
+    std::vector<uint8_t> panels;
+    std::vector<ari_shoup::Weight> radix;
+};
+inline Weights make_weights(const std::vector<ari::Prime>& primes, unsigned limbs) {
+    const unsigned k_pad = (primes.size() + 15u) / 16u * 16u;
+    const unsigned l_pad = (limbs + 15u) / 16u * 16u;
+    Weights ret{std::vector<uint8_t>(size_t(4) * k_pad * l_pad), {}};
+    ret.radix.reserve(2 * primes.size());
+    for (unsigned k = 0; k < primes.size(); ++k) {
+        const auto& prime = primes[k];
+        ret.radix.push_back(ari_shoup::make_weight(prime.one, prime.p));
+        ret.radix.push_back(ari_shoup::make_weight(prime.r2, prime.p));
+        uint32_t weight = prime.one;
+        for (unsigned j = 0; j < limbs; ++j) {
+            for (unsigned d = 0; d < 4; ++d) {
+                const size_t off = ((size_t(d) * (l_pad / 16) + j / 16) * k_pad + k) * 16 + j % 16;
+                ret.panels[off] = uint8_t(weight >> (8 * d));
+            }
+            weight = uint32_t(uint64_t(weight) * prime.one % prime.p);
+        }
+    }
+    return ret;
+}
+} // namespace ari_encoder_setup
+
+#include <cstddef>
+#include <cstdint>
+
+namespace ari_wmma_encoder {
+struct WideDot {
+    std::uint32_t s0, s1, s2;
+};
+FHD inline unsigned round16(unsigned n) { return (n + 15u) & ~15u; }
+FHD inline std::size_t word_offset(unsigned digit,unsigned row,unsigned limb,
+                                     unsigned padded_rows,unsigned padded_limbs) {
+    return ((std::size_t(digit)*(padded_limbs/16)+limb/16)*padded_rows+row)*16+limb%16;
+}
+// Exact dot < 55*(2^32-1)*(2^31-1) < 2^69. Separate at the 32-bit
+// boundary instead of assembling all seven base-256 positions in uint64.
+FHD inline WideDot split_words(std::uint32_t d0,std::uint32_t d1,std::uint32_t d2,
+    std::uint32_t d3,std::uint32_t d4,std::uint32_t d5,std::uint32_t d6) {
+    const std::uint64_t low=d0+(std::uint64_t(d1)<<8)+(std::uint64_t(d2)<<16)
+                           +(std::uint64_t(d3)<<24);
+    const std::uint64_t high=d4+(std::uint64_t(d5)<<8)+(std::uint64_t(d6)<<16)+(low>>32);
+    return {std::uint32_t(low),std::uint32_t(high),std::uint32_t(high>>32)};
+}
+FHD inline std::uint32_t reduce_words(std::uint32_t s0,std::uint32_t s1,
+    std::uint32_t s2,const ari::Prime& p,const ari_shoup::Weight* radix_two) {
+    // radix_two = Shoup precomputations for 2^32 and 2^64 modulo p.
+    // All p are >2^30, so reducing s0 takes at most three subtractions.
+    std::uint32_t a=ari_shoup::canonical_word(s0,p.p);
+    std::uint32_t b=ari_shoup::lazy_product(s1,radix_two[0],p.p);
+    std::uint32_t c=ari_shoup::lazy_product(s2,radix_two[1],p.p);
+    if(b>=p.p)b-=p.p;
+    if(c>=p.p)c-=p.p;
+    return ari::add(ari::add(a,b,p.p),c,p.p);
+}
+FHD inline std::uint32_t reduce_diagonals(const std::uint32_t d[7],const ari::Prime& p,
+                                            const ari_shoup::Weight* radix_two) {
+    const WideDot s=split_words(d[0],d[1],d[2],d[3],d[4],d[5],d[6]);
+    return reduce_words(s.s0,s.s1,s.s2,p,radix_two);
+}
+FHD inline std::uint32_t twist_residue(std::uint32_t xR,std::uint32_t twist,
+                                        const ari::Prime& p) {
+    return ari::mont(xR,twist,p);
+}
+} // namespace ari_wmma_encoder
+
+#include <cuda_runtime.h>
+#include <mma.h>
+
+namespace ari_wmma_encoder {
+namespace wmma=nvcuda::wmma;
+using EncAcc=wmma::fragment<wmma::accumulator,16,16,16,int>;
+using EncA=wmma::fragment<wmma::matrix_a,16,16,16,unsigned char,wmma::row_major>;
+using EncB=wmma::fragment<wmma::matrix_b,16,16,16,unsigned char,wmma::col_major>;
+
+// Reorder coefficients by the NTT's initial bit permutation while packing;
+// the input remains unmodified. Padding is rewritten each run, not assumed.
+__global__ void pack_inputs(const std::uint32_t* __restrict__ a,
+    const std::uint32_t* __restrict__ b,std::uint8_t* __restrict__ dst,
+    unsigned n,unsigned l,unsigned bits) {
+    constexpr unsigned rows_per_cta=8;
+    const unsigned row=blockIdx.x*rows_per_cta+threadIdx.x/16;
+    const unsigned limb=blockIdx.y*16+threadIdx.x%16;
+    const unsigned np=round16(n),lp=round16(l),operand=blockIdx.z;
+    if(row>=np)return;
+    std::uint32_t v=0;
+    if(row<n&&limb<l) {
+        const unsigned original=__brev(row)>>(32-bits);
+        v=(operand?b:a)[std::size_t(original)*l+limb];
+    }
+    const unsigned out_row=operand*np+row;
+    #pragma unroll
+    for(unsigned d=0;d<4;++d)
+        dst[word_offset(d,out_row,limb,2*np,lp)]=std::uint8_t(v>>(8*d));
+}
+
+// Each warp produces 16 (already bit-reversed) coefficients x 16 primes.
+// Store accumulator fragments column-major in shared so the modulus/twist
+// epilogue writes neighbouring coefficients to the same prime plane.
+__global__ void encode_gemm(const std::uint8_t* __restrict__ a,
+    const std::uint8_t* __restrict__ weights,std::uint32_t* __restrict__ ra,
+    std::uint32_t* __restrict__ rb,const ari::Prime* __restrict__ primes,
+    const ari_shoup::Weight* __restrict__ radix,const std::uint32_t* __restrict__ twist,
+    unsigned n,unsigned l,unsigned count) {
+    constexpr unsigned warps=4;
+    const unsigned lane=threadIdx.x%32,warp=threadIdx.x/32;
+    const unsigned r0=blockIdx.x*16,k0=(blockIdx.y*warps+warp)*16;
+    if(k0>=count)return;  // uniform within warp, no CTA-wide barriers
+    const unsigned np=round16(n),kp=round16(count),lp=round16(l),operand=blockIdx.z;
+    EncAcc diag[7];
+    #pragma unroll
+    for(unsigned d=0;d<7;++d)wmma::fill_fragment(diag[d],0);
+    for(unsigned j=0;j<lp;j+=16) {
+        EncA af[4];EncB bf[4];
+        #pragma unroll
+        for(unsigned d=0;d<4;++d) {
+            wmma::load_matrix_sync(af[d],a+word_offset(d,operand*np+r0,j,2*np,lp),16);
+            wmma::load_matrix_sync(bf[d],weights+word_offset(d,k0,j,kp,lp),16);
+        }
+        #pragma unroll
+        for(unsigned u=0;u<4;++u) {
+            #pragma unroll
+            for(unsigned v=0;v<4;++v)wmma::mma_sync(diag[u+v],af[u],bf[v],diag[u+v]);
+        }
+    }
+    // diag[d] <= 4*55*255^2 = 14,305,500 < INT32_MAX.
+    #pragma unroll
+    for(int t=0;t<EncAcc::num_elements;++t) {
+        const WideDot s=split_words(diag[0].x[t],diag[1].x[t],diag[2].x[t],
+            diag[3].x[t],diag[4].x[t],diag[5].x[t],diag[6].x[t]);
+        diag[0].x[t]=static_cast<int>(s.s0);
+        diag[1].x[t]=static_cast<int>(s.s1);
+        diag[2].x[t]=static_cast<int>(s.s2);
+    }
+    __shared__ __align__(32) int words[warps][3][256];
+    #pragma unroll
+    for(unsigned d=0;d<3;++d)
+        wmma::store_matrix_sync(words[warp][d],diag[d],16,wmma::mem_col_major);
+    __syncwarp();
+    std::uint32_t* out=operand?rb:ra;
+    #pragma unroll
+    for(unsigned elem=lane;elem<256;elem+=32) {
+        const unsigned k=k0+elem/16,r=r0+elem%16;
+        if(k<count&&r<n) {
+            const auto p=primes[k];
+            const auto xR=reduce_words(std::uint32_t(words[warp][0][elem]),
+                std::uint32_t(words[warp][1][elem]),std::uint32_t(words[warp][2][elem]),
+                p,radix+2*k);
+            const std::size_t at=std::size_t(k)*n+r;
+            out[at]=twist_residue(xR,twist[at],p);
+        }
+    }
+}
+// packed_inputs needs 4 * (2*round16(n)) * round16(l) bytes. packed_weights
+// needs 4 * round16(count) * round16(l) bytes, zeroed outside its true shape.
+inline cudaError_t launch(const std::uint32_t *a,const std::uint32_t *b,
+    std::uint32_t *ra,std::uint32_t *rb,std::uint8_t *packed_inputs,
+    const std::uint8_t *packed_weights,const ari::Prime *primes,
+    const ari_shoup::Weight *radix_shoup,const std::uint32_t *twist_reversed,
+    unsigned n,unsigned limbs,unsigned log_n,unsigned count,cudaStream_t stream=nullptr) {
+    if(n<2||n>65536||(n&(n-1))||!limbs||limbs>55||!count||
+       log_n>16||(1u<<log_n)!=n)return cudaErrorInvalidValue;
+    pack_inputs<<<dim3(round16(n)/8,round16(limbs)/16,2),128,0,stream>>>
+        (a,b,packed_inputs,n,limbs,log_n);
+    auto status=cudaGetLastError();if(status!=cudaSuccess)return status;
+    encode_gemm<<<dim3(round16(n)/16,(count+63)/64,2),128,0,stream>>>
+       (packed_inputs,packed_weights,ra,rb,primes,radix_shoup,twist_reversed,n,limbs,count);
+    return cudaGetLastError();
+}
+} // namespace ari_wmma_encoder
+
 #ifndef FHERMA_NTT_TILED
 #define FHERMA_NTT_TILED 1
 #endif
@@ -817,7 +998,8 @@ struct State {
     ari::Plan plan;
     Buffer<uint32_t> a,b,c,ra,rb,rc,roots,inverse_roots,twist,untwist;
     Buffer<ari::Prime> primes;
-    Buffer<ari_shoup::Weight> weights;
+    Buffer<uint8_t> packed_inputs, packed_weights;
+    Buffer<ari_shoup::Weight> radix;
 #if FHERMA_PINNED_INPUT
     HostBuffer<uint32_t> host_a,host_b;
 #endif
@@ -842,7 +1024,11 @@ void* fherma_init(const fherma::Point& p) {
     s->host_c.alloc(words);
 #endif
     s->ra.alloc(residues);s->rb.alloc(residues);s->rc.alloc(residues);
-    s->weights.copy(ari_shoup::make_weights(s->plan.primes,p.L));
+    const unsigned n_pad=(p.N+15u)/16u*16u, l_pad=(p.L+15u)/16u*16u;
+    s->packed_inputs.alloc(size_t(8)*n_pad*l_pad);
+    const auto weights=ari_encoder_setup::make_weights(s->plan.primes,p.L);
+    s->packed_weights.copy(weights.panels);
+    s->radix.copy(weights.radix);
     s->primes.copy(s->plan.primes);s->roots.copy(s->plan.roots);
     s->inverse_roots.copy(s->plan.inverse_roots);s->twist.copy(ari_shoup::reorder_twists(s->plan.twist,p.N,s->plan.logN));s->untwist.copy(s->plan.untwist);
     std::vector<uint32_t> primes;for(auto prime:s->plan.primes)primes.push_back(prime.p);
@@ -871,8 +1057,9 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
 #if !FHERMA_NTT_TILED
     const dim3 butterflies((p.N/2+255)/256,p.K);
 #endif
-    check(ari_shoup::launch(s.a.ptr,s.b.ptr,s.ra.ptr,s.rb.ptr,s.primes.ptr,s.weights.ptr,
-          s.twist.ptr,p.N,p.L,p.logN,p.K),"encode Shoup");
+    check(ari_wmma_encoder::launch(s.a.ptr,s.b.ptr,s.ra.ptr,s.rb.ptr,
+          s.packed_inputs.ptr,s.packed_weights.ptr,s.primes.ptr,s.radix.ptr,
+          s.twist.ptr,p.N,p.L,p.logN,p.K),"encode integer Tensor Cores");
 #if FHERMA_NTT_TILED
     check(ari_tile::transform<true>(s.ra.ptr,s.rb.ptr,s.primes.ptr,s.roots.ptr,p.N,p.K),"tiled forward NTT");
 #else
