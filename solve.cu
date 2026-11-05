@@ -2,6 +2,108 @@
 // RNS NTT + centered CRT. Initial GPU implementation; validation pending.
 // Interface/harness: https://github.com/fherma-ai/polynomial-mult-cupqc-example
 #include "fherma.h"
+#include <cuda_runtime.h>
+// Include at global scope. Host-only, read-only topology; no NVML dependency.
+#include <algorithm>
+#include <cerrno>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <limits>
+#include <string>
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
+namespace ari_topology {
+inline bool canonical_bdf(const char* input,char (&out)[32]) {
+    unsigned domain=0,bus=0,device=0,function=0;char extra=0;
+    if(!input || std::sscanf(input,"%x:%x:%x.%x%c",&domain,&bus,&device,&function,&extra)!=4 ||
+       domain>0xffff || bus>0xff || device>0x1f || function>7)return false;
+    std::snprintf(out,sizeof(out),"%04x:%02x:%02x.%x",domain,bus,device,function);
+    return true;
+}
+inline bool read_line(const std::string& path,std::string& line) {
+    std::ifstream input(path);return bool(std::getline(input,line));
+}
+#if defined(__linux__)
+inline bool cpu_list(const std::string& text,cpu_set_t& result) {
+    CPU_ZERO(&result);const char* at=text.c_str();bool any=false;
+    while(*at){
+        while(std::isspace(static_cast<unsigned char>(*at)))++at;
+        if(!std::isdigit(static_cast<unsigned char>(*at)))return false;
+        char* next=nullptr;errno=0;const auto first=std::strtoul(at,&next,10);
+        if(errno || next==at)return false;
+        at=next;auto last=first;
+        if(*at=='-'){
+            ++at;if(!std::isdigit(static_cast<unsigned char>(*at)))return false;
+            errno=0;last=std::strtoul(at,&next,10);
+            if(errno || next==at || last<first)return false;
+            at=next;
+        }
+        if(first<CPU_SETSIZE)
+            for(unsigned long cpu=first;cpu<=std::min(last,static_cast<unsigned long>(CPU_SETSIZE-1));++cpu)
+                CPU_SET(cpu,&result);
+        any=true;
+        while(std::isspace(static_cast<unsigned char>(*at)))++at;
+        if(!*at)return any;
+        if(*at++!=',' || !*at)return false;
+    }
+    return any;
+}
+inline std::string cpu_ranges(const cpu_set_t& mask) {
+    std::string out;
+    for(unsigned first=0;first<CPU_SETSIZE;++first)if(CPU_ISSET(first,&mask)){
+        unsigned last=first;
+        while(last+1<CPU_SETSIZE && CPU_ISSET(last+1,&mask))++last;
+        if(!out.empty())out+=',';
+        out+=std::to_string(first);
+        if(last!=first)out+='-'+std::to_string(last);
+        first=last;
+    }
+    return out.empty()?"none":out;
+}
+#endif
+inline void report(int device,const char* returned_bdf,int cuda_status=0) noexcept {
+    try {
+#if defined(__linux__)
+        cpu_set_t allowed,local,intersection;CPU_ZERO(&allowed);CPU_ZERO(&local);CPU_ZERO(&intersection);
+        const int affinity_status=::sched_getaffinity(0,sizeof(allowed),&allowed);
+        const int affinity_errno=affinity_status?errno:0;
+        const int current=::sched_getcpu();char bdf[32]={};
+        const bool valid=!cuda_status && canonical_bdf(returned_bdf,bdf);
+        std::string numa="unknown",list;
+        const std::string root=valid?std::string("/sys/bus/pci/devices/")+bdf:std::string();
+        if(valid){std::string value;if(read_line(root+"/numa_node",value))numa=value;}
+        const bool have_local=valid && read_line(root+"/local_cpulist",list) && cpu_list(list,local);
+        if(have_local && !affinity_status)
+            for(unsigned cpu=0;cpu<CPU_SETSIZE;++cpu)
+                if(CPU_ISSET(cpu,&local) && CPU_ISSET(cpu,&allowed))CPU_SET(cpu,&intersection);
+        std::fprintf(stderr,"ARI_CPU_GPU_TOPO device=%d pci=%s current_cpu=%d allowed_count=%d "
+            "allowed=%s gpu_numa=%s gpu_local_count=%d gpu_local_allowed_count=%d "
+            "gpu_local_allowed=%s affinity_errno=%d cuda_status=%d\n",device,valid?bdf:"unknown",
+            current,affinity_status?-1:CPU_COUNT(&allowed),affinity_status?"unknown":cpu_ranges(allowed).c_str(),
+            numa.c_str(),have_local?CPU_COUNT(&local):-1,have_local&&!affinity_status?CPU_COUNT(&intersection):-1,
+            have_local&&!affinity_status?cpu_ranges(intersection).c_str():"unknown",affinity_errno,cuda_status);
+#else
+        (void)returned_bdf;std::fprintf(stderr,"ARI_CPU_GPU_TOPO device=%d unsupported_os cuda_status=%d\n",device,cuda_status);
+#endif
+    }catch(...){std::fprintf(stderr,"ARI_CPU_GPU_TOPO unavailable\n");}
+}
+} // namespace ari_topology
+
+// Place at global scope after CUDA and topology.hpp are included globally.
+// Call once in fherma_init after the existing successful setup synchronization.
+void report_gpu_cpu_topology() noexcept {
+    int device=-1;char bdf[32]={};
+    auto status=cudaGetDevice(&device);
+    if(status==cudaSuccess)
+        status=cudaDeviceGetPCIBusId(bdf,int(sizeof(bdf)),device);
+    if(status!=cudaSuccess)(void)cudaGetLastError();
+    ari_topology::report(device,status==cudaSuccess?bdf:nullptr,int(status));
+}
+
 
 // ---- rns_core.h ----
 #include <cstdint>
@@ -420,21 +522,28 @@ struct DeviceArgs {
     unsigned n, limbs, bits, count;
     u32 gap;
     PrimeInfo *primes;
-    u32 *weights, *q;
+    u32 *weights, *q, *factor;
+    const ari::Prime *mont_primes; // owned by enclosing State
 };
-__global__ void reconstruct_kernel(DeviceArgs plan, const u32 *residues, u32 *out) {
+__global__ void reconstruct_kernel(DeviceArgs plan, const u32 *residues, u32 *out,
+                                   unsigned begin,unsigned end) {
     extern __shared__ unsigned long long shared[];
     unsigned x = threadIdx.x, y = threadIdx.y;
-    unsigned coef = blockIdx.x * tile_x + x;
+    const unsigned base=begin+blockIdx.x*tile_x;
+    const unsigned coef=base+x;
     unsigned k = plan.count, l = plan.limbs, pitch = k + 1;
     u64 *low = reinterpret_cast<u64 *>(shared);
     u64 *high = low + l * tile_x;
     u32 *terms = reinterpret_cast<u32 *>(high + l * tile_x);
     u32 *digits = terms + pitch * tile_x;
-    bool active = coef < plan.n;
-    for (unsigned j = y; j < k; j += tile_y) {
-        u32 r = active ? residues[std::size_t(j) * plan.n + coef] : 0;
-        terms[j * tile_x + x] = weight_residue(r, plan.primes[j]);
+    const bool active=coef<end;
+    for(unsigned j=y;j<k;j+=tile_y){
+        u32 t=0;
+        if(active){
+            const std::size_t at=std::size_t(j)*plan.n+coef;
+            t=ari::mont(residues[at],plan.factor[at],plan.mont_primes[j]);
+        }
+        terms[j*tile_x+x]=t;
     }
     __syncthreads();
     if (y == 0) {
@@ -449,8 +558,14 @@ __global__ void reconstruct_kernel(DeviceArgs plan, const u32 *residues, u32 *ou
     if (y == 0 && active) {
         carry_and_reduce<tile_x>(digits + x, low + x, high + x, l,
             plan.bits, plan.gap, plan.q);
-        for (unsigned i = 0; i < l; ++i)
-            out[std::size_t(coef) * l + i] = digits[i * tile_x + x];
+    }
+    __syncthreads();
+    // The carry lanes finished writing digit planes. All lanes cooperatively
+    // emit contiguous coefficient-major words, even for a short final tile.
+    const unsigned rows=end-base<tile_x?end-base:tile_x;
+    for(unsigned at=y*tile_x+x;at<rows*l;at+=tile_x*tile_y){
+        const unsigned row=at/l,col=at-row*l;
+        out[std::size_t(base)*l+at]=digits[col*tile_x+row];
     }
 }
 
@@ -468,9 +583,12 @@ class DevicePlan {
         if (args_.primes) cudaFree(args_.primes);
         if (args_.weights) cudaFree(args_.weights);
         if (args_.q) cudaFree(args_.q);
+        if (args_.factor) cudaFree(args_.factor);
     }
 public:
-    DevicePlan(unsigned n, const u32 *q, unsigned limbs, const std::vector<u32>& primes) {
+    DevicePlan(unsigned n,const u32* q,unsigned limbs,const std::vector<u32>& primes,
+               const std::vector<ari::Prime>& mont,const std::vector<u32>& untwist,
+               const ari::Prime* device_primes) {
         HostPlan plan = make_plan(n, q, limbs, primes);
         args_.n = n; args_.limbs = limbs; args_.bits = plan.bits;
         args_.count = unsigned(primes.size()); args_.gap = plan.gap;
@@ -481,15 +599,33 @@ public:
         if (status == cudaSuccess) status = cudaGetDeviceProperties(&prop, device);
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
         if (shared_ > prop.sharedMemPerBlock) throw std::invalid_argument("CRT tile exceeds shared memory capacity");
-        try { upload(args_.primes, plan.primes); upload(args_.weights, plan.weights); upload(args_.q, plan.q); }
+        if(mont.size()!=primes.size() || untwist.size()!=std::size_t(n)*primes.size())
+            throw std::invalid_argument("invalid CRT untwist table");
+        args_.mont_primes=device_primes;
+        std::vector<u32> factor(untwist.size());
+        for(unsigned j=0;j<primes.size();++j){
+            const auto prime=mont[j];
+            const auto inv=plan.primes[j].inv;
+            for(unsigned i=0;i<n;++i){
+                const std::size_t at=std::size_t(j)*n+i;
+                // mont(x,factor) = x*untwist*inv/R^2, exactly the old
+                // decode(x) times the ordinary CRT reconstruction weight.
+                factor[at]=ari::mont(untwist[at],inv,prime);
+            }
+        }
+        try { upload(args_.primes, plan.primes); upload(args_.weights, plan.weights);
+              upload(args_.q, plan.q); upload(args_.factor, factor); }
         catch (...) { release(); throw; }
     }
     DevicePlan(const DevicePlan&) = delete;
     DevicePlan& operator=(const DevicePlan&) = delete;
     ~DevicePlan() { release(); }
     // Asynchronous, caller checks eventual execution status when consuming out.
-    cudaError_t run(const u32 *residues, u32 *out, cudaStream_t stream = nullptr) const {
-        reconstruct_kernel<<<(args_.n + tile_x - 1) / tile_x, dim3(tile_x, tile_y), shared_, stream>>>(args_, residues, out);
+    cudaError_t run(const u32 *residues,u32 *out,unsigned begin,unsigned end,
+                    cudaStream_t stream=nullptr) const {
+        if(begin>=end||end>args_.n)return cudaErrorInvalidValue;
+        reconstruct_kernel<<<(end-begin+tile_x-1)/tile_x,dim3(tile_x,tile_y),shared_,stream>>>
+            (args_,residues,out,begin,end);
         return cudaGetLastError();
     }
 };
@@ -1033,13 +1169,13 @@ template<class T> struct Buffer {
     void alloc(size_t n){check(cudaMalloc(reinterpret_cast<void**>(&ptr),n*sizeof(T)),"cudaMalloc");}
     void copy(const std::vector<T>& x){alloc(x.size());check(cudaMemcpy(ptr,x.data(),x.size()*sizeof(T),cudaMemcpyHostToDevice),"setup upload");}
 };
-struct OperandStream {
+struct AsyncStream {
     cudaStream_t handle=nullptr;
-    OperandStream(){
-        check(cudaStreamCreateWithFlags(&handle,cudaStreamNonBlocking),"create A stream");
+    AsyncStream(){
+        check(cudaStreamCreateWithFlags(&handle,cudaStreamNonBlocking),"create non-blocking stream");
     }
-    OperandStream(const OperandStream&)=delete;
-    ~OperandStream(){if(handle)cudaStreamDestroy(handle);}
+    AsyncStream(const AsyncStream&)=delete;
+    ~AsyncStream(){if(handle)cudaStreamDestroy(handle);}
 };
 struct ReadyEvent {
     cudaEvent_t handle=nullptr;
@@ -1049,22 +1185,26 @@ struct ReadyEvent {
     ReadyEvent(const ReadyEvent&)=delete;
     ~ReadyEvent(){if(handle)cudaEventDestroy(handle);}
 };
-// The normal output stream joins A before pointwise multiplication. Before
-// that join, a partial failure may have submitted work on either stream.
+constexpr unsigned max_parts=4;
+inline unsigned part_boundary(unsigned n,unsigned i,unsigned parts){return n/parts*i+(n%parts)*i/parts;}
+inline unsigned result_parts(size_t bytes){return bytes>=(8u<<20)?max_parts:1u;}
+// Own all asynchronous work until the registered host memory can be released.
 struct RunFence {
     bool completed=false;
-    cudaStream_t operand_a;
-    explicit RunFence(cudaStream_t a):operand_a(a){}
+    cudaStream_t operand_a,download;
+    RunFence(cudaStream_t a,cudaStream_t result):operand_a(a),download(result){}
     RunFence(const RunFence&)=delete;
     ~RunFence(){
         if(!completed){
             cudaStreamSynchronize(operand_a);
             cudaStreamSynchronize(nullptr);
+            if(download)cudaStreamSynchronize(download);
         }
     }
     void complete(){
         check(cudaStreamSynchronize(nullptr),"complete measured work");
         check(cudaStreamSynchronize(operand_a),"check A stream completion");
+        if(download)check(cudaStreamSynchronize(download),"complete registered output");
         completed=true;
     }
 };
@@ -1083,11 +1223,6 @@ __global__ void single_stage(uint32_t* a,const ari::Prime* primes,const uint32_t
     uint32_t x=a[base+i],y=a[base+i+half];ari::butterfly(x,y,w,p);a[base+i]=x;a[base+i+half]=y;
 }
 #endif
-__global__ void decode(uint32_t* a,const ari::Prime* primes,const uint32_t* untwist,unsigned N) {
-    const unsigned i=blockIdx.x*blockDim.x+threadIdx.x,k=blockIdx.y;if(i>=N)return;
-    const size_t at=size_t(k)*N+i;const auto p=primes[k];
-    a[at]=ari::mont(ari::mont(a[at],untwist[at],p),1,p);
-}
 // Capability diagnostics only. A missing optional attribute is logged as -1.
 void report_host_access_capabilities(){
     int device=-1;
@@ -1116,10 +1251,10 @@ void report_host_access_capabilities(){
 }
 struct State {
     ari::Plan plan;
-    OperandStream stream_a;
-    ReadyEvent forward_a,uploaded[2];
+    AsyncStream stream_a,download;
+    ReadyEvent forward_a,uploaded[2],produced[max_parts];
     const ari_staggered::Address page_size=ari_staggered::host_page_size();
-    Buffer<uint32_t> a,b,c,ra,rb,rc,roots,inverse_roots,twist,untwist;
+    Buffer<uint32_t> a,b,c,ra,rb,rc,roots,inverse_roots,twist;
     Buffer<ari::Prime> primes;
     Buffer<uint8_t> packed_inputs, packed_weights;
     Buffer<ari_shoup::Weight> radix;
@@ -1139,11 +1274,13 @@ void* fherma_init(const fherma::Point& p) {
     s->packed_weights.copy(weights.panels);
     s->radix.copy(weights.radix);
     s->primes.copy(s->plan.primes);s->roots.copy(s->plan.roots);
-    s->inverse_roots.copy(s->plan.inverse_roots);s->twist.copy(ari_shoup::reorder_twists(s->plan.twist,p.N,s->plan.logN));s->untwist.copy(s->plan.untwist);
+    s->inverse_roots.copy(s->plan.inverse_roots);s->twist.copy(ari_shoup::reorder_twists(s->plan.twist,p.N,s->plan.logN));
     std::vector<uint32_t> primes;for(auto prime:s->plan.primes)primes.push_back(prime.p);
-    s->crt=std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes);
+    s->crt=std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes,
+        s->plan.primes,s->plan.untwist,s->primes.ptr);
     check(cudaDeviceSynchronize(),"initialize GPU");
     report_host_access_capabilities();
+    report_gpu_cpu_topology();
     return s.release();
 }
 
@@ -1155,7 +1292,9 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     // ranges, then free the caller-owned result's ordinary vector storage.
     fherma::Outputs out;out.c.shape={int64_t(p.N),int64_t(p.L)};
     ari_staggered::Registrations registered(s.page_size);
-    RunFence fence(s.stream_a.handle);
+    const unsigned parts=result_parts(bytes);
+    cudaStream_t download=parts>1?s.download.handle:nullptr;
+    RunFence fence(s.stream_a.handle,download);
     const dim3 grid((p.N+255)/256,p.K);
 #if !FHERMA_NTT_TILED
     const dim3 butterflies((p.N/2+255)/256,p.K);
@@ -1199,18 +1338,26 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
         check(cudaGetLastError(),"inverse NTT launch");
     }
 #endif
-    decode<<<grid,256>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
-    check(cudaGetLastError(),"decode launch");
-    check(s.crt->run(s.rc.ptr,s.c.ptr),"CRT launch");
-    // Both inputs, transforms and CRT have been enqueued. Prepare the final
-    // vector while GPU work may still be running. Every word is constructed.
+    // Queue every producer first, so constructing/registering C does not
+    // delay any CRT stripe. Each writes its own coefficient span in device C.
+    for(unsigned part=0;part<parts;++part){
+        const unsigned first=part_boundary(p.N,part,parts),last=part_boundary(p.N,part+1,parts);
+        check(s.crt->run(s.rc.ptr,s.c.ptr,first,last),"fused CRT stripe");
+        if(download)check(cudaEventRecord(s.produced[part].handle,nullptr),"mark CRT stripe ready");
+    }
     out.c.data.resize(words);
     const auto output_pages=registered.acquire(out.c.data.data(),bytes);
-    registered.for_chunks(out.c.data.data(),bytes,[&](size_t offset,size_t amount){
-        auto* dst=reinterpret_cast<unsigned char*>(out.c.data.data())+offset;
-        const auto* src=reinterpret_cast<const unsigned char*>(s.c.ptr)+offset;
-        check(cudaMemcpyAsync(dst,src,amount,cudaMemcpyDeviceToHost,nullptr),"download registered output");
-    });
+    for(unsigned part=0;part<parts;++part){
+        const size_t first=size_t(part_boundary(p.N,part,parts))*p.L;
+        const size_t last=size_t(part_boundary(p.N,part+1,parts))*p.L;
+        auto* dst=reinterpret_cast<unsigned char*>(out.c.data.data()+first);
+        const auto* src=reinterpret_cast<const unsigned char*>(s.c.ptr+first);
+        if(download)check(cudaStreamWaitEvent(download,s.produced[part].handle,0),"wait for CRT stripe");
+        registered.for_chunks(dst,(last-first)*sizeof(uint32_t),[&](size_t offset,size_t amount){
+            check(cudaMemcpyAsync(dst+offset,src+offset,amount,cudaMemcpyDeviceToHost,download),
+                  "download registered CRT stripe");
+        });
+    }
     // Only the completed H2D copies read the borrowed inputs. No later
     // kernel uses those pages. Keep any registration shared with C until
     // the final D2H completes, even if C uses only a fragment of its range.
