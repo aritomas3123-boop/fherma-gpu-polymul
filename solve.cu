@@ -410,394 +410,90 @@ inline Words reconstruct_one(const HostPlan &p, const u32 *r, std::size_t stride
 // ---- rns_crt.cuh ----
 #include <cuda_runtime.h>
 
-#include <array>
-#include <limits>
-#include <vector>
+namespace fherma_crt {
+// Prime-major input [p][coefficient], coefficient-major canonical output
+// [coefficient][limb]. Threads in a row read neighbouring coefficients.
+constexpr unsigned tile_x = 16;
+constexpr unsigned tile_y = 8;
 
-namespace ari_tensor {
-using fherma_crt::u32;
-using fherma_crt::u64;
-using fherma_crt::HostPlan;
-using fherma_crt::Words;
-inline unsigned ceil_multiple(unsigned val,unsigned multiple) {
-    return ((val+multiple-1)/multiple)*multiple;
-}
-inline u32 fixed_reciprocal(u32 p) {
-    // floor(2^52/p) fits in 32 bits for the NTT's p>2^30.
-    if(p<=(1u<<20)) throw std::invalid_argument("RNS prime too small for quantised CRT");
-    return u32((u64(1)<<52)/p);
-}
-#ifdef __CUDACC__
-#define ARI_TC_HD __host__ __device__
-#else
-#define ARI_TC_HD
-#endif
-ARI_TC_HD inline u32 fixed_fraction(u32 t,u32 reciprocal) {
-#ifdef __CUDA_ARCH__
-    return __umulhi(t,reciprocal);
-#else
-    return u32(u64(t)*reciprocal>>32);
-#endif
-}
-ARI_TC_HD inline u32 nearest_crt_integer(u32 sum_of_fractions) {
-    // Each fixed_fraction differs from 2^20*t/p by < 1+t/2^32 < 1.5.
-    // At most 1024 terms => absolute scaled sum error < 0.0015. The
-    // certified true sum is within 1/4 of an integer, so rounding is exact.
-    return (sum_of_fractions+(1u<<19))>>20;
-}
-ARI_TC_HD inline std::size_t packed_index(unsigned d,unsigned inner,unsigned row,unsigned kpad,unsigned rowpad) {
-    return ((std::size_t(d)*(kpad/16)+inner/16)*rowpad+row)*16+inner%16;
-}
-ARI_TC_HD inline u32 byte_at(u32 value,unsigned which) {return (value>>(8*which))&255u;}
-inline std::vector<std::uint8_t> pack_weights(const HostPlan& p,unsigned kpad,unsigned lpad) {
-    std::vector<std::uint8_t> out(std::size_t(4)*lpad*kpad);
-    const unsigned terms=unsigned(p.primes.size())+1;
-    for(unsigned d=0;d<4;++d)
-        for(unsigned l=0;l<p.limbs;++l)for(unsigned k=0;k<terms;++k)
-            out[packed_index(d,k,l,kpad,lpad)]=std::uint8_t(byte_at(p.weights[l*terms+k],d));
-    return out;
-}
-} // namespace ari_tensor
-#undef ARI_TC_HD
-
-#include <cstddef>
-#include <cstdint>
-#include <stdexcept>
-#include <vector>
-
-namespace ari_wmma_crt {
-constexpr unsigned tile = 16;
-constexpr unsigned warps_per_block = 4;
-#ifdef __CUDACC__
-#define ARI_WMMA_HD __host__ __device__
-#else
-#define ARI_WMMA_HD
-#endif
-
-ARI_WMMA_HD inline unsigned padded_rows(unsigned rows) {
-    return (rows + tile - 1) / tile * tile;
-}
-// Byte planes are split again into K=16 panels. Each row within a panel
-// contributes exactly 16 contiguous bytes. A and B tile bases always lie on
-// 256-byte boundaries, including the odd K panels (WMMA requires 32 bytes).
-ARI_WMMA_HD inline std::size_t packed_offset(unsigned digit, unsigned row, unsigned inner,
-                                              unsigned rows_padded, unsigned k_padded) {
-    return ((std::size_t(digit) * (k_padded / tile) + inner / tile) * rows_padded
-            + row) * tile + inner % tile;
-}
-struct SplitSum { std::uint64_t lo, hi; };
-// Each d_i is the sum of all byte products at base-256 place i. Separate
-// at 2^32 so the complete (possibly >64-bit) result is never formed.
-ARI_WMMA_HD inline SplitSum split_diagonals(std::uint32_t d0, std::uint32_t d1,
-    std::uint32_t d2, std::uint32_t d3, std::uint32_t d4,
-    std::uint32_t d5, std::uint32_t d6) {
-    const std::uint64_t lo = d0 + (std::uint64_t(d1) << 8) + (std::uint64_t(d2) << 16)
-                               + (std::uint64_t(d3) << 24);
-    const std::uint64_t hi = d4 + (std::uint64_t(d5) << 8) + (std::uint64_t(d6) << 16);
-    return {std::uint32_t(lo), hi + (lo >> 32)};
-}
-// Input is the existing CRT-plan weights table [limb][term]. The same generic
-// helper can also pack a host term matrix [coefficient][term] in validation.
-inline std::vector<std::uint8_t> pack_host_rows(const std::uint32_t *src,
-    unsigned rows, unsigned active_terms, unsigned k_padded) {
-    if (!rows || !active_terms || (k_padded % tile) || active_terms > k_padded ||
-        k_padded > 4096)
-        throw std::invalid_argument("invalid tensor CRT dimensions");
-    const unsigned pad = padded_rows(rows);
-    std::vector<std::uint8_t> out(std::size_t(4) * pad * k_padded);
-    for (unsigned row=0; row<rows; ++row)
-        for (unsigned j=0; j<active_terms; ++j) {
-            const std::uint32_t v = src[std::size_t(row) * active_terms + j];
-            for (unsigned b=0; b<4; ++b)
-                out[packed_offset(b,row,j,pad,k_padded)] = std::uint8_t(v >> (8*b));
-        }
-    return out;
-}
-#undef ARI_WMMA_HD
-} // namespace ari_wmma_crt
-
-#include <cuda_runtime.h>
-#include <mma.h>
-
-namespace ari_wmma_crt {
-namespace wmma = nvcuda::wmma;
-using Acc = wmma::fragment<wmma::accumulator,16,16,16,int>;
-using FragA = wmma::fragment<wmma::matrix_a,16,16,16,unsigned char,wmma::row_major>;
-using FragB = wmma::fragment<wmma::matrix_b,16,16,16,unsigned char,wmma::col_major>;
-
-// One warp per 16 coefficient x 16 limb tile. Four neighbouring output limb
-// tiles reuse each A panel in cache. Data in any padding must be zero.
-__global__ void gemm_kernel(const std::uint8_t *__restrict__ a,
-    const std::uint8_t *__restrict__ b, std::uint64_t *__restrict__ lo,
-    std::uint64_t *__restrict__ hi, unsigned n, unsigned columns, unsigned k_padded) {
-    const unsigned lane = threadIdx.x % 32;
-    const unsigned warp = threadIdx.x / 32;
-    const unsigned row0 = blockIdx.x * tile;
-    const unsigned col0 = (blockIdx.y * warps_per_block + warp) * tile;
-    if (col0 >= columns) return;  // warp-uniform; there are no CTA barriers.
-    const unsigned np = padded_rows(n), lp = padded_rows(columns);
-    Acc diag[7];
-    #pragma unroll
-    for (int d=0; d<7; ++d) wmma::fill_fragment(diag[d],0);
-
-    for (unsigned j=0; j<k_padded; j+=tile) {
-        FragA af[4]; FragB bf[4];
-        #pragma unroll
-        for (unsigned d=0; d<4; ++d) {
-            // Packed K panels each start at an aligned, contiguous 16x16 tile.
-            wmma::load_matrix_sync(af[d], a + packed_offset(d,row0,j,np,k_padded), tile);
-            wmma::load_matrix_sync(bf[d], b + packed_offset(d,col0,j,lp,k_padded), tile);
-        }
-        #pragma unroll
-        for (unsigned u=0; u<4; ++u) {
-            #pragma unroll
-            for (unsigned v=0; v<4; ++v)
-                wmma::mma_sync(diag[u+v], af[u], bf[v], diag[u+v]);
-        }
-    }
-    // On every allowed K: each diagonal <= 4*K*255^2 <= 1,065,369,600,
-    // so accumulating into a signed 32-bit integer is exact, with no FP.
-    // Accumulator fragment storage layout is undocumented; these matching
-    // fragments share the same type and shape. Operate elementwise, then let
-    // WMMA map the three resulting word planes back into matrix coordinates.
-    #pragma unroll
-    for (int t=0; t<Acc::num_elements; ++t) {
-        const auto s=split_diagonals(diag[0].x[t],diag[1].x[t],diag[2].x[t],
-            diag[3].x[t],diag[4].x[t],diag[5].x[t],diag[6].x[t]);
-        diag[0].x[t]=static_cast<int>(static_cast<std::uint32_t>(s.lo));
-        diag[1].x[t]=static_cast<int>(static_cast<std::uint32_t>(s.hi));
-        diag[2].x[t]=static_cast<int>(static_cast<std::uint32_t>(s.hi>>32));
-    }
-    __shared__ __align__(32) int words[warps_per_block][3][tile*tile];
-    #pragma unroll
-    for (unsigned d=0; d<3; ++d)
-        wmma::store_matrix_sync(words[warp][d],diag[d],tile,wmma::mem_row_major);
-    __syncwarp();
-    #pragma unroll
-    for (unsigned t=lane; t<tile*tile; t+=32) {
-        const unsigned row=row0+t/tile, col=col0+t%tile;
-        if (row<n && col<columns) {
-            const auto off=std::size_t(row)*columns+col;
-            lo[off]=std::uint32_t(words[warp][0][t]);
-            hi[off]=std::uint32_t(words[warp][1][t])
-                  | (std::uint64_t(std::uint32_t(words[warp][2][t]))<<32);
-        }
-    }
-}
-// K may be at most 4096 for the arithmetic guarantee above; K=64 and K=128
-// cover the official points. A and B must come from a 32-byte aligned device
-// allocation, normally cudaMalloc. All K and matrix tile padding must be zero.
-inline cudaError_t launch(const std::uint8_t* a,const std::uint8_t* b,
-    std::uint64_t* lo,std::uint64_t* hi,unsigned n,unsigned columns,
-    unsigned k_padded,cudaStream_t stream=nullptr) {
-    if (!n||!columns||!k_padded||k_padded>4096||k_padded%tile) return cudaErrorInvalidValue;
-    gemm_kernel<<<dim3((n+tile-1)/tile,(columns+tile*warps_per_block-1)/(tile*warps_per_block)),
-        32*warps_per_block,0,stream>>>(a,b,lo,hi,n,columns,k_padded);
-    return cudaGetLastError();
-}
-} // namespace ari_wmma_crt
-
-
-namespace ari_wmma_crt {
-constexpr unsigned max_fused_limbs = tile * warps_per_block;
-#ifdef __CUDACC__
-#define ARI_FUSED_HD __host__ __device__
-#else
-#define ARI_FUSED_HD
-#endif
-
-// All three planes are stored in column-major order [limb][tile row]. Each
-// row has a single owner. The two extra limbs on the low plane allow final
-// carry propagation and the shared q reduction before any global writes.
-ARI_FUSED_HD inline void normalize_fused_row(std::uint32_t *low,
-        const std::uint32_t *hi0, const std::uint32_t *hi1,
-        unsigned limbs,unsigned bits,std::uint32_t gap,const std::uint32_t *q) {
-    std::uint64_t carry=0;
-    for(unsigned col=0;col<limbs;++col) {
-        const unsigned i=col*tile;
-        carry+=low[i];
-        low[i]=std::uint32_t(carry);
-        const std::uint64_t high=hi0[i]|(std::uint64_t(hi1[i])<<32);
-        carry=high+(carry>>32);
-    }
-    low[limbs*tile]=std::uint32_t(carry);
-    low[(limbs+1)*tile]=std::uint32_t(carry>>32);
-    fherma_crt::reduce_sum<tile>(low,limbs,bits,gap,q);
-}
-#undef ARI_FUSED_HD
-} // namespace ari_wmma_crt
-
-
-namespace ari_wmma_crt {
-// Four warps cover up to 64 limbs for all 16 coefficients. Compute one
-// unnormalised limb dot product per matrix cell, retaining all results in
-// this CTA. No intermediate per-cell values are written to global memory.
-__global__ void gemm_finish_kernel(const std::uint8_t *__restrict__ a,
-    const std::uint8_t *__restrict__ b,std::uint32_t *__restrict__ out,
-    unsigned n,unsigned limbs,unsigned k_padded,unsigned bits,std::uint32_t gap,
-    const std::uint32_t *__restrict__ q) {
-    const unsigned tid=threadIdx.x, warp=tid/32;
-    const unsigned row0=blockIdx.x*tile, col0=warp*tile;
-    __shared__ __align__(32) int low[(max_fused_limbs+2)*tile];
-    __shared__ __align__(32) int hi0[max_fused_limbs*tile];
-    __shared__ __align__(32) int hi1[max_fused_limbs*tile];
-
-    // This predicate is uniform within a warp. Inactive warps never access
-    // unallocated B columns and still reach the block barriers below.
-    if(col0<limbs) {
-        Acc diag[7];
-        #pragma unroll
-        for(unsigned d=0;d<7;++d) wmma::fill_fragment(diag[d],0);
-        const unsigned np=padded_rows(n),lp=padded_rows(limbs);
-        for(unsigned j=0;j<k_padded;j+=tile) {
-            FragA af[4];FragB bf[4];
-            #pragma unroll
-            for(unsigned d=0;d<4;++d) {
-                wmma::load_matrix_sync(af[d],a+packed_offset(d,row0,j,np,k_padded),tile);
-                wmma::load_matrix_sync(bf[d],b+packed_offset(d,col0,j,lp,k_padded),tile);
-            }
-            #pragma unroll
-            for(unsigned u=0;u<4;++u) {
-                #pragma unroll
-                for(unsigned v=0;v<4;++v)
-                    wmma::mma_sync(diag[u+v],af[u],bf[v],diag[u+v]);
-            }
-        }
-        #pragma unroll
-        for(int e=0;e<Acc::num_elements;++e) {
-            const SplitSum s=split_diagonals(diag[0].x[e],diag[1].x[e],diag[2].x[e],
-                diag[3].x[e],diag[4].x[e],diag[5].x[e],diag[6].x[e]);
-            diag[0].x[e]=static_cast<int>(static_cast<std::uint32_t>(s.lo));
-            diag[1].x[e]=static_cast<int>(static_cast<std::uint32_t>(s.hi));
-            diag[2].x[e]=static_cast<int>(static_cast<std::uint32_t>(s.hi>>32));
-        }
-        // Each 16x16 tile is stored by column so lanes in the carry warp
-        // read 16 consecutive words when they process any particular limb.
-        wmma::store_matrix_sync(low+col0*tile,diag[0],tile,wmma::mem_col_major);
-        wmma::store_matrix_sync(hi0+col0*tile,diag[1],tile,wmma::mem_col_major);
-        wmma::store_matrix_sync(hi1+col0*tile,diag[2],tile,wmma::mem_col_major);
-    }
-    __syncthreads();
-
-    auto *digits=reinterpret_cast<std::uint32_t*>(low);
-    if(tid<tile && row0+tid<n)
-        normalize_fused_row(digits+tid,reinterpret_cast<const std::uint32_t*>(hi0)+tid,
-            reinterpret_cast<const std::uint32_t*>(hi1)+tid,limbs,bits,gap,q);
-    __syncthreads();
-
-    // Consecutive lanes write consecutive words in FHERMA's row-major
-    // coefficient layout. These are the kernel's only global stores.
-    for(unsigned i=tid;i<tile*limbs;i+=32*warps_per_block) {
-        const unsigned row=i/limbs,col=i-row*limbs;
-        if(row0+row<n)
-            out[std::size_t(row0)*limbs+i]=digits[col*tile+row];
-    }
-}
-
-inline cudaError_t launch_fused(const std::uint8_t* a,const std::uint8_t* b,
-    std::uint32_t* out,unsigned n,unsigned limbs,unsigned k_padded,unsigned bits,
-    std::uint32_t gap,const std::uint32_t* q,cudaStream_t stream=nullptr) {
-    if(!n||!limbs||limbs>max_fused_limbs||!k_padded||k_padded>4096||
-       k_padded%tile||bits<2||bits>limbs*32||(bits+31)/32!=limbs)
-        return cudaErrorInvalidValue;
-    gemm_finish_kernel<<<(n+tile-1)/tile,32*warps_per_block,0,stream>>>(
-        a,b,out,n,limbs,k_padded,bits,gap,q);
-    return cudaGetLastError();
-}
-} // namespace ari_wmma_crt
-
-#include <cuda_runtime.h>
-
-namespace ari_tensor {
-constexpr unsigned pack_x=16,pack_y=8;
-struct TensorArgs {
-    unsigned n, count, limbs, bits, n_pad, k_pad, l_pad;
+struct DeviceArgs {
+    unsigned n, limbs, bits, count;
     u32 gap;
-    fherma_crt::PrimeInfo *ps;
-    u32 *q, *reciprocal;
+    PrimeInfo *primes;
+    u32 *weights, *q;
 };
-// Read one prime plane at a time for 16 neighbouring coefficients, transpose
-// via shared memory, then write packed 16-byte fragments used by IMMA.
-__global__ void pack_terms(const u32 *residues,std::uint8_t *packed,TensorArgs s) {
-    extern __shared__ u32 buffer[];
-    const unsigned x=threadIdx.x,y=threadIdx.y,start=blockIdx.x*pack_x,c=start+x;
-    constexpr unsigned stride=pack_x+1;
-    u32 *terms=buffer, *partials=terms+s.k_pad*stride;
-    u32 partial=0;
-    for(unsigned j=y;j<s.k_pad;j+=pack_y){
-        u32 t=0;
-        if(j<s.count && c<s.n){
-            t=fherma_crt::weight_residue(residues[std::size_t(j)*s.n+c],s.ps[j]);
-            partial+=fixed_fraction(t,s.reciprocal[j]);
-        }
-        terms[j*stride+x]=t;
-    }
-    partials[y*stride+x]=partial;
-    __syncthreads();
-    if(y==0){
-        u32 q=0;
-        for(unsigned b=0;b<pack_y;++b)q+=partials[b*stride+x];
-        terms[s.count*stride+x]=nearest_crt_integer(q);
+__global__ void reconstruct_kernel(DeviceArgs plan, const u32 *residues, u32 *out) {
+    extern __shared__ unsigned long long shared[];
+    unsigned x = threadIdx.x, y = threadIdx.y;
+    unsigned coef = blockIdx.x * tile_x + x;
+    unsigned k = plan.count, l = plan.limbs, pitch = k + 1;
+    u64 *low = reinterpret_cast<u64 *>(shared);
+    u64 *high = low + l * tile_x;
+    u32 *terms = reinterpret_cast<u32 *>(high + l * tile_x);
+    u32 *digits = terms + pitch * tile_x;
+    bool active = coef < plan.n;
+    for (unsigned j = y; j < k; j += tile_y) {
+        u32 r = active ? residues[std::size_t(j) * plan.n + coef] : 0;
+        terms[j * tile_x + x] = weight_residue(r, plan.primes[j]);
     }
     __syncthreads();
-    for(unsigned index=y*pack_x+x;index<s.k_pad*pack_x;index+=pack_x*pack_y){
-        unsigned group=index/(pack_x*16),row=(index/16)%pack_x;
-        unsigned j=group*16+index%16, val=terms[j*stride+row];
-        for(unsigned d=0;d<4;++d){
-            auto off=packed_index(d,j,start+row,s.k_pad,s.n_pad);
-            packed[off]=std::uint8_t(byte_at(val,d));
-        }
+    if (y == 0) {
+        terms[k * tile_x + x] = correction<tile_x>(terms + x, plan.primes, k);
+    }
+    __syncthreads();
+    for (unsigned i = y; i < l; i += tile_y) {
+        sum_column<tile_x>(terms + x, plan.weights + i * pitch, pitch,
+            low[i * tile_x + x], high[i * tile_x + x]);
+    }
+    __syncthreads();
+    if (y == 0 && active) {
+        carry_and_reduce<tile_x>(digits + x, low + x, high + x, l,
+            plan.bits, plan.gap, plan.q);
+        for (unsigned i = 0; i < l; ++i)
+            out[std::size_t(coef) * l + i] = digits[i * tile_x + x];
     }
 }
-class DevicePlan {
-    TensorArgs s_{};
-    std::uint8_t *a_=nullptr,*b_=nullptr;
 
-    std::size_t pack_shared_=0;
-    static void check(cudaError_t st) {
-        if(st!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(st));
-    }
-    template<class T>static void allocate(T*& ptr,std::size_t n){
-        check(cudaMalloc(reinterpret_cast<void**>(&ptr),n*sizeof(T)));
-    }
-    template<class T>static void upload(T*& ptr,const std::vector<T>& values){
-        allocate(ptr,values.size());
-        check(cudaMemcpy(ptr,values.data(),values.size()*sizeof(T),cudaMemcpyHostToDevice));
+class DevicePlan {
+    DeviceArgs args_{};
+    std::size_t shared_ = 0;
+    template<class T> static void upload(T *&dst, const std::vector<T>& src) {
+        std::size_t bytes = src.size() * sizeof(T);
+        cudaError_t status = cudaMalloc(reinterpret_cast<void **>(&dst), bytes);
+        if (status == cudaSuccess)
+            status = cudaMemcpy(dst, src.data(), bytes, cudaMemcpyHostToDevice);
+        if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
     }
     void release() noexcept {
-        if(a_)cudaFree(a_); if(b_)cudaFree(b_); 
-        if(s_.ps)cudaFree(s_.ps); if(s_.reciprocal)cudaFree(s_.reciprocal); if(s_.q)cudaFree(s_.q);
+        if (args_.primes) cudaFree(args_.primes);
+        if (args_.weights) cudaFree(args_.weights);
+        if (args_.q) cudaFree(args_.q);
     }
 public:
-    DevicePlan(unsigned n,const u32 *q,unsigned l,const std::vector<u32>& primes){
-        auto h=fherma_crt::make_plan(n,q,l,primes);
-        s_.n=n;s_.limbs=l;s_.bits=h.bits;s_.gap=h.gap;s_.count=unsigned(primes.size());
-        s_.k_pad=ceil_multiple(s_.count+1,32);s_.l_pad=ceil_multiple(l,16);s_.n_pad=ceil_multiple(n,16);
-        std::vector<u32> reciprocals;
-        for(auto p:primes)reciprocals.push_back(fixed_reciprocal(p));
-        auto weights=pack_weights(h,s_.k_pad,s_.l_pad);
-        pack_shared_=(s_.k_pad+pack_y)*(pack_x+1)*sizeof(u32);
-        int dev;cudaDeviceProp prop{};
-        check(cudaGetDevice(&dev));check(cudaGetDeviceProperties(&prop,dev));
-        if(prop.major<8)throw std::runtime_error("integer WMMA CRT requires SM80 or newer");
-        if(pack_shared_>prop.sharedMemPerBlock)
-            throw std::runtime_error("integer WMMA CRT tile exceeds device shared memory");
-        try {
-            upload(s_.q,h.q);upload(s_.ps,h.primes);upload(s_.reciprocal,reciprocals);
-            upload(b_,weights);allocate(a_,4*std::size_t(s_.k_pad)*s_.n_pad);
-        }catch(...){release();throw;}
+    DevicePlan(unsigned n, const u32 *q, unsigned limbs, const std::vector<u32>& primes) {
+        HostPlan plan = make_plan(n, q, limbs, primes);
+        args_.n = n; args_.limbs = limbs; args_.bits = plan.bits;
+        args_.count = unsigned(primes.size()); args_.gap = plan.gap;
+        shared_ = tile_x * (2 * sizeof(u64) * limbs + sizeof(u32) * (primes.size() + 1 + limbs + 2));
+        int device = 0;
+        cudaDeviceProp prop{};
+        cudaError_t status = cudaGetDevice(&device);
+        if (status == cudaSuccess) status = cudaGetDeviceProperties(&prop, device);
+        if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+        if (shared_ > prop.sharedMemPerBlock) throw std::invalid_argument("CRT tile exceeds shared memory capacity");
+        try { upload(args_.primes, plan.primes); upload(args_.weights, plan.weights); upload(args_.q, plan.q); }
+        catch (...) { release(); throw; }
     }
-    ~DevicePlan(){release();}
-    DevicePlan(const DevicePlan&)=delete;
-    DevicePlan& operator=(const DevicePlan&)=delete;
-    cudaError_t run(const u32* residues,u32 *out,cudaStream_t stream=nullptr) const {
-        const dim3 block(pack_x,pack_y); const unsigned grid=(s_.n+pack_x-1)/pack_x;
-        pack_terms<<<grid,block,pack_shared_,stream>>>(residues,a_,s_);
-        auto st=cudaGetLastError();if(st!=cudaSuccess)return st;
-        return ari_wmma_crt::launch_fused(a_,b_,out,s_.n,s_.limbs,s_.k_pad,s_.bits,s_.gap,s_.q,stream);
+    DevicePlan(const DevicePlan&) = delete;
+    DevicePlan& operator=(const DevicePlan&) = delete;
+    ~DevicePlan() { release(); }
+    // Asynchronous, caller checks eventual execution status when consuming out.
+    cudaError_t run(const u32 *residues, u32 *out, cudaStream_t stream = nullptr) const {
+        reconstruct_kernel<<<(args_.n + tile_x - 1) / tile_x, dim3(tile_x, tile_y), shared_, stream>>>(args_, residues, out);
+        return cudaGetLastError();
     }
 };
-} // namespace ari_tensor
+} // namespace fherma_crt
 
 // ---- ntt_tile.cuh ----
 #ifndef FHERMA_TILE_COORDS_ONLY
@@ -1247,6 +943,12 @@ inline cudaError_t launch_operand(const std::uint32_t *input,std::uint32_t *resi
 #ifndef FHERMA_COPY_PARTICIPANTS
 #define FHERMA_COPY_PARTICIPANTS 24
 #endif
+#ifndef FHERMA_UPLOAD_CHUNKS
+#define FHERMA_UPLOAD_CHUNKS 4
+#endif
+static_assert(FHERMA_UPLOAD_CHUNKS == 1 || FHERMA_UPLOAD_CHUNKS == 2 ||
+              FHERMA_UPLOAD_CHUNKS == 4,
+              "expected one, two or four input upload chunks");
 static_assert(FHERMA_COPY_PARTICIPANTS >= 1 && FHERMA_COPY_PARTICIPANTS <= 24,
               "expected 1..24 copy participants");
 namespace ari_copy {
@@ -1439,7 +1141,7 @@ struct State {
 #if FHERMA_PINNED_OUTPUT
     HostBuffer<uint32_t> host_c;
 #endif
-    std::unique_ptr<ari_tensor::DevicePlan> crt;
+    std::unique_ptr<fherma_crt::DevicePlan> crt;
     explicit State(const fherma::Point& p):plan(p){}
 };
 // Calibration touches only owned, synthetic point-sized storage. All runtime
@@ -1532,7 +1234,7 @@ void* fherma_init(const fherma::Point& p) {
     s->primes.copy(s->plan.primes);s->roots.copy(s->plan.roots);
     s->inverse_roots.copy(s->plan.inverse_roots);s->twist.copy(ari_shoup::reorder_twists(s->plan.twist,p.N,s->plan.logN));s->untwist.copy(s->plan.untwist);
     std::vector<uint32_t> primes;for(auto prime:s->plan.primes)primes.push_back(prime.p);
-    s->crt=std::make_unique<ari_tensor::DevicePlan>(p.N,p.q.data.data(),p.L,primes);
+    s->crt=std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes);
     check(cudaDeviceSynchronize(),"initialize GPU");
     choose_staging(*s,words);
     return s.release();
@@ -1552,10 +1254,26 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
         uint32_t* residues=operand?s.rb.ptr:s.ra.ptr;
 #if FHERMA_PINNED_INPUT
         uint32_t* stage=operand?s.host_b.ptr:s.host_a.ptr;
-        s.copy_team->copy(stage,input,words,s.input_wc);
-        input=stage;
-#endif
+        // The complete operand has its own persistent staging buffer. DMA
+        // reads each published slice while the CPU fills a later, disjoint
+        // slice; no slice is overwritten until this call has been fenced.
+        // Keep boundaries on cache lines, including tiny supported points.
+        const size_t lines=words/16;
+        for(unsigned chunk=0;chunk<FHERMA_UPLOAD_CHUNKS;++chunk){
+            const size_t begin=16*(lines*chunk/FHERMA_UPLOAD_CHUNKS);
+            const size_t end=chunk+1==FHERMA_UPLOAD_CHUNKS?words:
+                16*(lines*(chunk+1)/FHERMA_UPLOAD_CHUNKS);
+            if(end==begin)continue;
+            s.copy_team->copy(stage+begin,input+begin,end-begin,s.input_wc);
+            check(cudaMemcpyAsync(device+begin,stage+begin,
+                (end-begin)*sizeof(uint32_t),cudaMemcpyHostToDevice,stream),
+                "upload staged operand slice");
+        }
+#else
         check(cudaMemcpyAsync(device,input,bytes,cudaMemcpyHostToDevice,stream),"upload operand");
+#endif
+        // The encoder's packing reads global bit-reversed coefficients.
+        // It must follow every slice upload in this same operand's stream.
         check(ari_wmma_encoder::launch_operand(device,residues,operand,s.packed_inputs.ptr,
             s.packed_weights.ptr,s.primes.ptr,s.radix.ptr,s.twist.ptr,
             p.N,p.L,p.logN,p.K,stream),"encode operand");
