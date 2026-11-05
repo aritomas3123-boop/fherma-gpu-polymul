@@ -607,16 +607,7 @@ inline cudaError_t transform(uint32_t *a, uint32_t *b, const ari::Prime *primes,
 #include <stdexcept>
 #include <string>
 #include <cstring>
-#ifndef FHERMA_PINNED_INPUT
-#define FHERMA_PINNED_INPUT 1
-#endif
-#ifndef FHERMA_PINNED_OUTPUT
-#define FHERMA_PINNED_OUTPUT 1
-#endif
-#ifndef FHERMA_INPUT_WRITE_COMBINED
-#define FHERMA_INPUT_WRITE_COMBINED 0
-#endif
-
+#include <cstdio>
 #include <cstdint>
 #include <vector>
 
@@ -925,6 +916,112 @@ inline cudaError_t launch_operand(const std::uint32_t *input,std::uint32_t *resi
 #define FHERMA_NTT_TILED 1
 #endif
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <unistd.h>
+
+namespace ari_staggered {
+using Address=std::uintptr_t;
+struct Range {Address begin=0,end=0;};
+inline Address host_page_size(){
+    const long size=::sysconf(_SC_PAGESIZE);
+    if(size<=0 || (size&(size-1)))throw std::runtime_error("invalid host page size");
+    return static_cast<Address>(size);
+}
+inline void cuda_check(cudaError_t status,const char* action){
+    if(status!=cudaSuccess)throw std::runtime_error(std::string(action)+": "+cudaGetErrorString(status));
+}
+// At most 1, then 2, then 4 new intervals can be needed when registering
+// three contiguous buffers. Entries stay separate until unregister, since the
+// runtime requires the exact original base address for each registration.
+class Registrations {
+    std::array<Range,7> entries{};
+    unsigned used=0;
+    Address page;
+    static Address byte_end(Address address,size_t size){
+        if(!address||!size||size>std::numeric_limits<Address>::max()-address)
+            throw std::invalid_argument("invalid registered buffer");
+        return address+size;
+    }
+    void acquire_gap(Address begin,Address end){
+        if(begin==end)return;
+        if(used>=entries.size())throw std::logic_error("too many registration segments");
+        cuda_check(cudaHostRegister(reinterpret_cast<void*>(begin),end-begin,cudaHostRegisterDefault),
+                   "register buffer segment");
+        // No allocating or throwing operation follows acquisition.
+        entries[used++]={begin,end};
+    }
+    bool release_one(Range& entry,cudaError_t& first_error){
+        if(!entry.begin)return true;
+        const auto status=cudaHostUnregister(reinterpret_cast<void*>(entry.begin));
+        if(status==cudaSuccess){entry={};return true;}
+        if(first_error==cudaSuccess)first_error=status;
+        return false;
+    }
+public:
+    explicit Registrations(Address bytes_per_page):page(bytes_per_page){}
+    Registrations(const Registrations&)=delete;
+    ~Registrations(){
+        cudaError_t ignored=cudaSuccess;
+        for(unsigned i=0;i<used;++i)release_one(entries[i],ignored);
+    }
+    Range acquire(const void* pointer,size_t bytes){
+        const auto address=reinterpret_cast<Address>(pointer);
+        const auto end=byte_end(address,bytes);
+        if(end>std::numeric_limits<Address>::max()-(page-1))
+            throw std::invalid_argument("host page bound overflow");
+        const Range target{address&~(page-1),(end+page-1)&~(page-1)};
+        const unsigned old_used=used;
+        auto cursor=target.begin;
+        for(unsigned i=0;i<old_used && cursor<target.end;++i){
+            const auto held=entries[i];
+            if(held.end<=cursor)continue;
+            if(held.begin>=target.end)break;
+            if(held.begin>cursor)acquire_gap(cursor,held.begin);
+            cursor=std::max(cursor,held.end);
+        }
+        if(cursor<target.end)acquire_gap(cursor,target.end);
+        std::sort(entries.begin(),entries.begin()+used,[](Range a,Range b){return a.begin<b.begin;});
+        return target;
+    }
+    // Issue separate DMA operations if this logical buffer crosses two
+    // independently registered regions. The normal case is a single DMA.
+    template<class Copy>
+    void for_chunks(const void* pointer,size_t bytes,Copy&& copy)const{
+        const auto start=reinterpret_cast<Address>(pointer);
+        const auto end=byte_end(start,bytes);
+        auto cursor=start;
+        for(unsigned i=0;i<used && cursor<end;++i){
+            const auto held=entries[i];
+            if(held.end<=cursor)continue;
+            if(held.begin>cursor)break;
+            const auto stop=std::min(held.end,end);
+            copy(cursor-start,stop-cursor);
+            cursor=stop;
+        }
+        if(cursor!=end)throw std::logic_error("DMA range has missing registration");
+    }
+    void release_inputs(Range output){
+        cudaError_t first=cudaSuccess;
+        for(unsigned i=0;i<used;++i){
+            auto& held=entries[i];
+            if(held.end<=output.begin || held.begin>=output.end)release_one(held,first);
+        }
+        cuda_check(first,"unregister input segments");
+    }
+    void release_all(){
+        cudaError_t first=cudaSuccess;
+        for(unsigned i=0;i<used;++i)release_one(entries[i],first);
+        cuda_check(first,"unregister remaining segments");
+    }
+};
+} // namespace ari_staggered
+
 namespace {
 void check(cudaError_t e,const char* where) {
     if(e!=cudaSuccess) throw std::runtime_error(std::string(where)+": "+cudaGetErrorString(e));
@@ -936,18 +1033,6 @@ template<class T> struct Buffer {
     void alloc(size_t n){check(cudaMalloc(reinterpret_cast<void**>(&ptr),n*sizeof(T)),"cudaMalloc");}
     void copy(const std::vector<T>& x){alloc(x.size());check(cudaMemcpy(ptr,x.data(),x.size()*sizeof(T),cudaMemcpyHostToDevice),"setup upload");}
 };
-// Persistent page-locked staging belongs exclusively to State. Every copy of
-// operand/result bytes still occurs inside the measured fherma_run call.
-template<class T> struct HostBuffer {
-    T* ptr=nullptr;
-    HostBuffer()=default;
-    HostBuffer(const HostBuffer&)=delete;
-    HostBuffer& operator=(const HostBuffer&)=delete;
-    ~HostBuffer(){if(ptr)cudaFreeHost(ptr);}
-    void alloc(size_t n,unsigned flags=cudaHostAllocDefault){
-        check(cudaHostAlloc(reinterpret_cast<void**>(&ptr),n*sizeof(T),flags),"cudaHostAlloc staging");
-    }
-};
 struct OperandStream {
     cudaStream_t handle=nullptr;
     OperandStream(){
@@ -956,13 +1041,13 @@ struct OperandStream {
     OperandStream(const OperandStream&)=delete;
     ~OperandStream(){if(handle)cudaStreamDestroy(handle);}
 };
-struct ForwardReady {
+struct ReadyEvent {
     cudaEvent_t handle=nullptr;
-    ForwardReady(){
-        check(cudaEventCreateWithFlags(&handle,cudaEventDisableTiming),"create A ready event");
+    ReadyEvent(){
+        check(cudaEventCreateWithFlags(&handle,cudaEventDisableTiming),"create pipeline event");
     }
-    ForwardReady(const ForwardReady&)=delete;
-    ~ForwardReady(){if(handle)cudaEventDestroy(handle);}
+    ReadyEvent(const ReadyEvent&)=delete;
+    ~ReadyEvent(){if(handle)cudaEventDestroy(handle);}
 };
 // The normal output stream joins A before pointwise multiplication. Before
 // that join, a partial failure may have submitted work on either stream.
@@ -1003,20 +1088,41 @@ __global__ void decode(uint32_t* a,const ari::Prime* primes,const uint32_t* untw
     const size_t at=size_t(k)*N+i;const auto p=primes[k];
     a[at]=ari::mont(ari::mont(a[at],untwist[at],p),1,p);
 }
+// Capability diagnostics only. A missing optional attribute is logged as -1.
+void report_host_access_capabilities(){
+    int device=-1;
+    if(cudaGetDevice(&device)!=cudaSuccess){
+        (void)cudaGetLastError();
+        std::fprintf(stderr,"ARI_HOST_ACCESS device=-1\n");
+        return;
+    }
+    auto attribute=[device](cudaDeviceAttr attr){
+        int value=-1;
+        if(cudaDeviceGetAttribute(&value,attr,device)!=cudaSuccess){
+            (void)cudaGetLastError();
+            return -1;
+        }
+        return value;
+    };
+    const int pageable=attribute(cudaDevAttrPageableMemoryAccess);
+    const int host_tables=attribute(cudaDevAttrPageableMemoryAccessUsesHostPageTables);
+    const int concurrent=attribute(cudaDevAttrConcurrentManagedAccess);
+    const int registered_pointer=attribute(cudaDevAttrCanUseHostPointerForRegisteredMem);
+    const int uva=attribute(cudaDevAttrUnifiedAddressing);
+    std::fprintf(stderr,"ARI_HOST_ACCESS device=%d pageableMemoryAccess=%d "
+        "pageableMemoryAccessUsesHostPageTables=%d concurrentManagedAccess=%d "
+        "canUseHostPointerForRegisteredMem=%d unifiedAddressing=%d\n",
+        device,pageable,host_tables,concurrent,registered_pointer,uva);
+}
 struct State {
     ari::Plan plan;
     OperandStream stream_a;
-    ForwardReady forward_a;
+    ReadyEvent forward_a,uploaded[2];
+    const ari_staggered::Address page_size=ari_staggered::host_page_size();
     Buffer<uint32_t> a,b,c,ra,rb,rc,roots,inverse_roots,twist,untwist;
     Buffer<ari::Prime> primes;
     Buffer<uint8_t> packed_inputs, packed_weights;
     Buffer<ari_shoup::Weight> radix;
-#if FHERMA_PINNED_INPUT
-    HostBuffer<uint32_t> host_a,host_b;
-#endif
-#if FHERMA_PINNED_OUTPUT
-    HostBuffer<uint32_t> host_c;
-#endif
     std::unique_ptr<fherma_crt::DevicePlan> crt;
     explicit State(const fherma::Point& p):plan(p){}
 };
@@ -1026,14 +1132,6 @@ void* fherma_init(const fherma::Point& p) {
     auto s=std::make_unique<State>(p);
     const size_t words=size_t(p.N)*p.L, residues=size_t(p.N)*s->plan.K;
     s->a.alloc(words);s->b.alloc(words);s->c.alloc(words);
-#if FHERMA_PINNED_INPUT
-    const unsigned host_flags=FHERMA_INPUT_WRITE_COMBINED?cudaHostAllocWriteCombined:cudaHostAllocDefault;
-    s->host_a.alloc(words,host_flags);s->host_b.alloc(words,host_flags);
-#endif
-#if FHERMA_PINNED_OUTPUT
-    // Output is cacheable: the CPU must read it when constructing the vector.
-    s->host_c.alloc(words);
-#endif
     s->ra.alloc(residues);s->rb.alloc(residues);s->rc.alloc(residues);
     const unsigned n_pad=(p.N+15u)/16u*16u, l_pad=(p.L+15u)/16u*16u;
     s->packed_inputs.alloc(size_t(8)*n_pad*l_pad);
@@ -1045,6 +1143,7 @@ void* fherma_init(const fherma::Point& p) {
     std::vector<uint32_t> primes;for(auto prime:s->plan.primes)primes.push_back(prime.p);
     s->crt=std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes);
     check(cudaDeviceSynchronize(),"initialize GPU");
+    report_host_access_capabilities();
     return s.release();
 }
 
@@ -1052,6 +1151,10 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     auto& s=*static_cast<State*>(state);const auto& p=s.plan;
     const size_t words=size_t(p.N)*p.L,bytes=words*sizeof(uint32_t);
     if(in.a.data.size()!=words||in.b.data.size()!=words)throw std::runtime_error("input size does not match point");
+    // Reverse lifetime order on exceptions: drain streams, unregister all
+    // ranges, then free the caller-owned result's ordinary vector storage.
+    fherma::Outputs out;out.c.shape={int64_t(p.N),int64_t(p.L)};
+    ari_staggered::Registrations registered(s.page_size);
     RunFence fence(s.stream_a.handle);
     const dim3 grid((p.N+255)/256,p.K);
 #if !FHERMA_NTT_TILED
@@ -1060,12 +1163,13 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     auto submit_operand=[&](unsigned operand,const uint32_t* input,cudaStream_t stream){
         uint32_t* device=operand?s.b.ptr:s.a.ptr;
         uint32_t* residues=operand?s.rb.ptr:s.ra.ptr;
-#if FHERMA_PINNED_INPUT
-        uint32_t* stage=operand?s.host_b.ptr:s.host_a.ptr;
-        std::memcpy(stage,input,bytes);
-        input=stage;
-#endif
-        check(cudaMemcpyAsync(device,input,bytes,cudaMemcpyHostToDevice,stream),"upload operand");
+        registered.acquire(input,bytes);
+        registered.for_chunks(input,bytes,[&](size_t offset,size_t amount){
+            auto* dst=reinterpret_cast<unsigned char*>(device)+offset;
+            const auto* src=reinterpret_cast<const unsigned char*>(input)+offset;
+            check(cudaMemcpyAsync(dst,src,amount,cudaMemcpyHostToDevice,stream),"upload registered input");
+        });
+        check(cudaEventRecord(s.uploaded[operand].handle,stream),"mark last H2D read");
         check(ari_wmma_encoder::launch_operand(device,residues,operand,s.packed_inputs.ptr,
             s.packed_weights.ptr,s.primes.ptr,s.radix.ptr,s.twist.ptr,
             p.N,p.L,p.logN,p.K,stream),"encode operand");
@@ -1082,7 +1186,7 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     };
     submit_operand(0,in.a.data.data(),s.stream_a.handle);
     check(cudaEventRecord(s.forward_a.handle,s.stream_a.handle),"mark A transform complete");
-    // This CPU staging copy and the B upload may overlap A's encoder/NTT.
+    // Register B only after the entire A branch has been submitted.
     submit_operand(1,in.b.data.data(),nullptr);
     check(cudaStreamWaitEvent(nullptr,s.forward_a.handle,0),"join A and B before product");
     multiply_reverse<<<grid,256>>>(s.ra.ptr,s.rb.ptr,s.rc.ptr,s.primes.ptr,p.N,p.logN);
@@ -1098,21 +1202,23 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     decode<<<grid,256>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
     check(cudaGetLastError(),"decode launch");
     check(s.crt->run(s.rc.ptr,s.c.ptr),"CRT launch");
-    fherma::Outputs out;out.c.shape={int64_t(p.N),int64_t(p.L)};
-#if FHERMA_PINNED_OUTPUT
-    // Allocate the returned vector's storage while preceding GPU kernels run,
-    // but do not create/zero its elements before the result arrives.
-    check(cudaMemcpyAsync(s.host_c.ptr,s.c.ptr,bytes,cudaMemcpyDeviceToHost,nullptr),"download staged result");
-    out.c.data.reserve(words);
-    fence.complete();
-    // Range initialization writes final values directly instead of first
-    // zero-filling a vector. It still allocates and copies inside the clock.
-    out.c.data.assign(s.host_c.ptr,s.host_c.ptr+words);
-#else
+    // Both inputs, transforms and CRT have been enqueued. Prepare the final
+    // vector while GPU work may still be running. Every word is constructed.
     out.c.data.resize(words);
-    check(cudaMemcpy(out.c.data.data(),s.c.ptr,bytes,cudaMemcpyDeviceToHost),"download result");
+    const auto output_pages=registered.acquire(out.c.data.data(),bytes);
+    registered.for_chunks(out.c.data.data(),bytes,[&](size_t offset,size_t amount){
+        auto* dst=reinterpret_cast<unsigned char*>(out.c.data.data())+offset;
+        const auto* src=reinterpret_cast<const unsigned char*>(s.c.ptr)+offset;
+        check(cudaMemcpyAsync(dst,src,amount,cudaMemcpyDeviceToHost,nullptr),"download registered output");
+    });
+    // Only the completed H2D copies read the borrowed inputs. No later
+    // kernel uses those pages. Keep any registration shared with C until
+    // the final D2H completes, even if C uses only a fragment of its range.
+    check(cudaEventSynchronize(s.uploaded[0].handle),"wait for A host read");
+    check(cudaEventSynchronize(s.uploaded[1].handle),"wait for B host read");
+    registered.release_inputs(output_pages);
     fence.complete();
-#endif
+    registered.release_all();
     return out;
 }
 void fherma_free(void* state) {delete static_cast<State*>(state);}
