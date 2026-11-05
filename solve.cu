@@ -604,11 +604,18 @@ inline cudaError_t transform(uint32_t *a, uint32_t *b, const ari::Prime *primes,
 // The generated fherma.h and harness are supplied by FHERMA's example.
 #include <cuda_runtime.h>
 #include <memory>
-#include <array>
-#include <chrono>
-#include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <cstring>
+#ifndef FHERMA_PINNED_INPUT
+#define FHERMA_PINNED_INPUT 1
+#endif
+#ifndef FHERMA_PINNED_OUTPUT
+#define FHERMA_PINNED_OUTPUT 1
+#endif
+#ifndef FHERMA_INPUT_WRITE_COMBINED
+#define FHERMA_INPUT_WRITE_COMBINED 0
+#endif
 
 #include <cstdint>
 #include <vector>
@@ -750,6 +757,30 @@ template<class T> struct Buffer {
     void alloc(size_t n){check(cudaMalloc(reinterpret_cast<void**>(&ptr),n*sizeof(T)),"cudaMalloc");}
     void copy(const std::vector<T>& x){alloc(x.size());check(cudaMemcpy(ptr,x.data(),x.size()*sizeof(T),cudaMemcpyHostToDevice),"setup upload");}
 };
+// Persistent page-locked staging belongs exclusively to State. Every copy of
+// operand/result bytes still occurs inside the measured fherma_run call.
+template<class T> struct HostBuffer {
+    T* ptr=nullptr;
+    HostBuffer()=default;
+    HostBuffer(const HostBuffer&)=delete;
+    HostBuffer& operator=(const HostBuffer&)=delete;
+    ~HostBuffer(){if(ptr)cudaFreeHost(ptr);}
+    void alloc(size_t n,unsigned flags=cudaHostAllocDefault){
+        check(cudaHostAlloc(reinterpret_cast<void**>(&ptr),n*sizeof(T),flags),"cudaHostAlloc staging");
+    }
+};
+// An exception must not leave DMA reading a staging buffer while a subsequent
+// call overwrites it. The normal path reports stream errors before returning.
+struct RunFence {
+    bool completed=false;
+    RunFence()=default;
+    RunFence(const RunFence&)=delete;
+    ~RunFence(){if(!completed)cudaStreamSynchronize(nullptr);}
+    void complete(){
+        check(cudaStreamSynchronize(nullptr),"complete measured work");
+        completed=true;
+    }
+};
 #if !FHERMA_NTT_TILED
 __global__ void forward_stage(uint32_t* a,uint32_t* b,const ari::Prime* primes,
                               const uint32_t* roots,unsigned N,unsigned half) {
@@ -782,50 +813,17 @@ __global__ void decode(uint32_t* a,const ari::Prime* primes,const uint32_t* untw
     const size_t at=size_t(k)*N+i;const auto p=primes[k];
     a[at]=ari::mont(ari::mont(a[at],untwist[at],p),1,p);
 }
-using ProfileClock = std::chrono::steady_clock;
-double profile_ms(ProfileClock::duration d) {
-    return std::chrono::duration<double,std::milli>(d).count();
-}
-// Development build only: events, one extra sync and host measurements alter the
-// wall clock. We emit aggregate durations, never inputs or computed coefficients.
-struct StageProfile {
-    cudaEvent_t event[7]{};
-    std::vector<std::array<double, 9>> calls;
-    StageProfile() {
-        try { for(auto& e : event) check(cudaEventCreate(&e),"create profiler event"); }
-        catch (...) { for(auto e : event) if(e) cudaEventDestroy(e); throw; }
-    }
-    ~StageProfile(){ for(auto e:event) if(e)cudaEventDestroy(e); }
-    void mark(unsigned i){ check(cudaEventRecord(event[i]),"mark GPU stage"); }
-    void complete_compute(){ check(cudaEventSynchronize(event[6]),"complete profiled compute"); }
-    void capture(double upload,double allocate,double download) {
-        std::array<double,9> one{}; one[0]=upload;
-        for(unsigned i=0;i<6;++i) {
-            float ms=0; check(cudaEventElapsedTime(&ms,event[i],event[i+1]),"elapsed stage");
-            one[i+1]=ms;
-        }
-        one[7]=allocate; one[8]=download; calls.push_back(one);
-    }
-    void report(unsigned n,unsigned w) {
-        if(calls.empty()) return;
-        const char *names[]={"input_copy_host","encode","ntt_fwd","pointwise_permute",
-            "ntt_inv","decode","crt","output_allocate_host","output_copy_host"};
-        std::fprintf(stderr,"ari_profile N=%u W=%u calls=%zu stages_median_ms",n,w,calls.size());
-        for(unsigned col=0;col<9;++col) {
-            std::vector<double> v; for(auto const& row:calls)v.push_back(row[col]);
-            std::sort(v.begin(),v.end());
-            double med=(v[(v.size()-1)/2]+v[v.size()/2])*0.5;
-            std::fprintf(stderr," %s=%.5f",names[col],med);
-        }
-        std::fprintf(stderr,"\n"); std::fflush(stderr);
-    }
-};
 struct State {
     ari::Plan plan;
-    StageProfile prof;
     Buffer<uint32_t> a,b,c,ra,rb,rc,roots,inverse_roots,twist,untwist;
     Buffer<ari::Prime> primes;
     Buffer<ari_shoup::Weight> weights;
+#if FHERMA_PINNED_INPUT
+    HostBuffer<uint32_t> host_a,host_b;
+#endif
+#if FHERMA_PINNED_OUTPUT
+    HostBuffer<uint32_t> host_c;
+#endif
     std::unique_ptr<fherma_crt::DevicePlan> crt;
     explicit State(const fherma::Point& p):plan(p){}
 };
@@ -835,6 +833,14 @@ void* fherma_init(const fherma::Point& p) {
     auto s=std::make_unique<State>(p);
     const size_t words=size_t(p.N)*p.L, residues=size_t(p.N)*s->plan.K;
     s->a.alloc(words);s->b.alloc(words);s->c.alloc(words);
+#if FHERMA_PINNED_INPUT
+    const unsigned host_flags=FHERMA_INPUT_WRITE_COMBINED?cudaHostAllocWriteCombined:cudaHostAllocDefault;
+    s->host_a.alloc(words,host_flags);s->host_b.alloc(words,host_flags);
+#endif
+#if FHERMA_PINNED_OUTPUT
+    // Output is cacheable: the CPU must read it when constructing the vector.
+    s->host_c.alloc(words);
+#endif
     s->ra.alloc(residues);s->rb.alloc(residues);s->rc.alloc(residues);
     s->weights.copy(ari_shoup::make_weights(s->plan.primes,p.L));
     s->primes.copy(s->plan.primes);s->roots.copy(s->plan.roots);
@@ -849,19 +855,24 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     auto& s=*static_cast<State*>(state);const auto& p=s.plan;
     const size_t words=size_t(p.N)*p.L,bytes=words*sizeof(uint32_t);
     if(in.a.data.size()!=words||in.b.data.size()!=words)throw std::runtime_error("input size does not match point");
-    auto t0=ProfileClock::now();
+    RunFence fence;
+#if FHERMA_PINNED_INPUT
+    std::memcpy(s.host_a.ptr,in.a.data.data(),bytes);
+    check(cudaMemcpyAsync(s.a.ptr,s.host_a.ptr,bytes,cudaMemcpyHostToDevice,nullptr),"upload staged a");
+    // This host copy can overlap the preceding A DMA. B is not enqueued
+    // until its staging copy has finished; all GPU work stays in stream zero.
+    std::memcpy(s.host_b.ptr,in.b.data.data(),bytes);
+    check(cudaMemcpyAsync(s.b.ptr,s.host_b.ptr,bytes,cudaMemcpyHostToDevice,nullptr),"upload staged b");
+#else
     check(cudaMemcpy(s.a.ptr,in.a.data.data(),bytes,cudaMemcpyHostToDevice),"upload a");
     check(cudaMemcpy(s.b.ptr,in.b.data.data(),bytes,cudaMemcpyHostToDevice),"upload b");
-    check(cudaStreamSynchronize(nullptr),"complete profiled upload");
-    double upload=profile_ms(ProfileClock::now()-t0);
-    s.prof.mark(0);
+#endif
     const dim3 grid((p.N+255)/256,p.K);
 #if !FHERMA_NTT_TILED
     const dim3 butterflies((p.N/2+255)/256,p.K);
 #endif
     check(ari_shoup::launch(s.a.ptr,s.b.ptr,s.ra.ptr,s.rb.ptr,s.primes.ptr,s.weights.ptr,
           s.twist.ptr,p.N,p.L,p.logN,p.K),"encode Shoup");
-    s.prof.mark(1);
 #if FHERMA_NTT_TILED
     check(ari_tile::transform<true>(s.ra.ptr,s.rb.ptr,s.primes.ptr,s.roots.ptr,p.N,p.K),"tiled forward NTT");
 #else
@@ -870,10 +881,8 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
         check(cudaGetLastError(),"forward NTT launch");
     }
 #endif
-    s.prof.mark(2);
     multiply_reverse<<<grid,256>>>(s.ra.ptr,s.rb.ptr,s.rc.ptr,s.primes.ptr,p.N,p.logN);
     check(cudaGetLastError(),"multiply launch");
-    s.prof.mark(3);
 #if FHERMA_NTT_TILED
     check(ari_tile::transform<false>(s.rc.ptr,nullptr,s.primes.ptr,s.inverse_roots.ptr,p.N,p.K),"tiled inverse NTT");
 #else
@@ -882,19 +891,24 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
         check(cudaGetLastError(),"inverse NTT launch");
     }
 #endif
-    s.prof.mark(4);
     decode<<<grid,256>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
     check(cudaGetLastError(),"decode launch");
-    s.prof.mark(5);
     check(s.crt->run(s.rc.ptr,s.c.ptr),"CRT launch");
-    s.prof.mark(6);
-    s.prof.complete_compute();
-    t0=ProfileClock::now();
-    fherma::Outputs out;out.c.shape={int64_t(p.N),int64_t(p.L)};out.c.data.resize(words);
-    double allocate=profile_ms(ProfileClock::now()-t0);
-    t0=ProfileClock::now();
+    fherma::Outputs out;out.c.shape={int64_t(p.N),int64_t(p.L)};
+#if FHERMA_PINNED_OUTPUT
+    // Allocate the returned vector's storage while preceding GPU kernels run,
+    // but do not create/zero its elements before the result arrives.
+    check(cudaMemcpyAsync(s.host_c.ptr,s.c.ptr,bytes,cudaMemcpyDeviceToHost,nullptr),"download staged result");
+    out.c.data.reserve(words);
+    fence.complete();
+    // Range initialization writes final values directly instead of first
+    // zero-filling a vector. It still allocates and copies inside the clock.
+    out.c.data.assign(s.host_c.ptr,s.host_c.ptr+words);
+#else
+    out.c.data.resize(words);
     check(cudaMemcpy(out.c.data.data(),s.c.ptr,bytes,cudaMemcpyDeviceToHost),"download result");
-    s.prof.capture(upload,allocate,profile_ms(ProfileClock::now()-t0));
+    fence.completed=true; // Blocking D2H completed all preceding stream work.
+#endif
     return out;
 }
-void fherma_free(void* state) { auto* s=static_cast<State*>(state); if(s)s->prof.report(s->plan.N,s->plan.W); delete s; }
+void fherma_free(void* state) {delete static_cast<State*>(state);}
