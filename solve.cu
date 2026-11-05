@@ -414,7 +414,7 @@ namespace fherma_crt {
 // Prime-major input [p][coefficient], coefficient-major canonical output
 // [coefficient][limb]. Threads in a row read neighbouring coefficients.
 constexpr unsigned tile_x = 16;
-constexpr unsigned tile_y = 8;
+constexpr unsigned tile_y = 16;
 
 struct DeviceArgs {
     unsigned n, limbs, bits, count;
@@ -1119,40 +1119,6 @@ __global__ void decode(uint32_t* a,const ari::Prime* primes,const uint32_t* untw
     const size_t at=size_t(k)*N+i;const auto p=primes[k];
     a[at]=ari::mont(ari::mont(a[at],untwist[at],p),1,p);
 }
-#ifndef FHERMA_COMPUTE_GRAPHS
-#define FHERMA_COMPUTE_GRAPHS 1
-#endif
-// Graphs contain kernels only. They retain State-owned device addresses and
-// public point parameters, never borrowed input vectors or operand contents.
-struct ComputeGraph {
-    cudaGraph_t graph=nullptr;
-    cudaGraphExec_t executable=nullptr;
-    ComputeGraph()=default;
-    ComputeGraph(const ComputeGraph&)=delete;
-    ComputeGraph& operator=(const ComputeGraph&)=delete;
-    ~ComputeGraph(){
-        if(executable)cudaGraphExecDestroy(executable);
-        if(graph)cudaGraphDestroy(graph);
-    }
-    template<class Launcher>
-    void capture(cudaStream_t stream,Launcher launcher){
-        check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal),
-              "begin compute graph capture");
-        try{launcher();}
-        catch(...){
-            cudaGraph_t discarded=nullptr;
-            (void)cudaStreamEndCapture(stream,&discarded);
-            if(discarded)cudaGraphDestroy(discarded);
-            throw;
-        }
-        check(cudaStreamEndCapture(stream,&graph),"end compute graph capture");
-        check(cudaGraphInstantiateWithFlags(&executable,graph,0),
-              "instantiate compute graph");
-    }
-    void launch(cudaStream_t stream)const{
-        check(cudaGraphLaunch(executable,stream),"launch compute graph");
-    }
-};
 struct State {
     ari::Plan plan;
     OperandStream stream_a;
@@ -1170,66 +1136,8 @@ struct State {
     HostBuffer<uint32_t> host_c;
 #endif
     std::unique_ptr<fherma_crt::DevicePlan> crt;
-#if FHERMA_COMPUTE_GRAPHS
-    // Declared after the allocations/CRT so executable graphs are destroyed
-    // first, after every fherma_run has fenced all outstanding GPU work.
-    ComputeGraph operand_graph_a,operand_graph_b,result_graph;
-#endif
     explicit State(const fherma::Point& p):plan(p){}
 };
-void enqueue_operand_compute(State& s,unsigned operand,cudaStream_t stream){
-    const auto& p=s.plan;
-    uint32_t* device=operand?s.b.ptr:s.a.ptr;
-    uint32_t* residues=operand?s.rb.ptr:s.ra.ptr;
-#if !FHERMA_NTT_TILED
-    const dim3 butterflies((p.N/2+255)/256,p.K);
-#endif
-        check(ari_wmma_encoder::launch_operand(device,residues,operand,s.packed_inputs.ptr,
-            s.packed_weights.ptr,s.primes.ptr,s.radix.ptr,s.twist.ptr,
-            p.N,p.L,p.logN,p.K,stream),"encode operand");
-#if FHERMA_NTT_TILED
-        // The template selects the number of arrays. The roots select direction.
-        check(ari_tile::transform<false>(residues,nullptr,s.primes.ptr,s.roots.ptr,
-                                        p.N,p.K,stream),"single-operand forward NTT");
-#else
-        for(unsigned half=1;half<p.N;half*=2){
-            single_stage<<<butterflies,256,0,stream>>>(residues,s.primes.ptr,s.roots.ptr,p.N,half);
-            check(cudaGetLastError(),"single-operand forward stage");
-        }
-#endif
-}
-void enqueue_result_compute(State& s,cudaStream_t stream){
-    const auto& p=s.plan;
-    const dim3 grid((p.N+255)/256,p.K);
-#if !FHERMA_NTT_TILED
-    const dim3 butterflies((p.N/2+255)/256,p.K);
-#endif
-    multiply_reverse<<<grid,256,0,stream>>>(s.ra.ptr,s.rb.ptr,s.rc.ptr,s.primes.ptr,p.N,p.logN);
-    check(cudaGetLastError(),"multiply launch");
-#if FHERMA_NTT_TILED
-    check(ari_tile::transform<false>(s.rc.ptr,nullptr,s.primes.ptr,s.inverse_roots.ptr,p.N,p.K,stream),"tiled inverse NTT");
-#else
-    for(unsigned half=1;half<p.N;half*=2) {
-        single_stage<<<butterflies,256,0,stream>>>(s.rc.ptr,s.primes.ptr,s.inverse_roots.ptr,p.N,half);
-        check(cudaGetLastError(),"inverse NTT launch");
-    }
-#endif
-    decode<<<grid,256,0,stream>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
-    check(cudaGetLastError(),"decode launch");
-    check(s.crt->run(s.rc.ptr,s.c.ptr,stream),"CRT launch");
-}
-#if FHERMA_COMPUTE_GRAPHS
-void prepare_compute_graphs(State& s){
-    // Capturing records the kernel DAG without executing it. All addresses
-    // point into persistent allocations and all parameters depend only on p.
-    // Use the existing non-blocking setup stream, which choose_staging fenced.
-    const auto stream=s.stream_a.handle;
-    s.operand_graph_a.capture(stream,[&]{enqueue_operand_compute(s,0,stream);});
-    s.operand_graph_b.capture(stream,[&]{enqueue_operand_compute(s,1,stream);});
-    s.result_graph.capture(stream,[&]{enqueue_result_compute(s,stream);});
-}
-#endif
-
 // Calibration touches only owned, synthetic point-sized storage. All runtime
 // inputs, outputs, CUDA work and waits remain inside their normal call.
 void choose_staging(State& s,size_t words){
@@ -1323,9 +1231,6 @@ void* fherma_init(const fherma::Point& p) {
     s->crt=std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes);
     check(cudaDeviceSynchronize(),"initialize GPU");
     choose_staging(*s,words);
-#if FHERMA_COMPUTE_GRAPHS
-    prepare_compute_graphs(*s);
-#endif
     return s.release();
 }
 
@@ -1334,19 +1239,31 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     const size_t words=size_t(p.N)*p.L,bytes=words*sizeof(uint32_t);
     if(in.a.data.size()!=words||in.b.data.size()!=words)throw std::runtime_error("input size does not match point");
     RunFence fence(s.stream_a.handle);
+    const dim3 grid((p.N+255)/256,p.K);
+#if !FHERMA_NTT_TILED
+    const dim3 butterflies((p.N/2+255)/256,p.K);
+#endif
     auto submit_operand=[&](unsigned operand,const uint32_t* input,cudaStream_t stream){
         uint32_t* device=operand?s.b.ptr:s.a.ptr;
+        uint32_t* residues=operand?s.rb.ptr:s.ra.ptr;
 #if FHERMA_PINNED_INPUT
         uint32_t* stage=operand?s.host_b.ptr:s.host_a.ptr;
         s.copy_team->copy(stage,input,words,s.input_wc);
         input=stage;
 #endif
         check(cudaMemcpyAsync(device,input,bytes,cudaMemcpyHostToDevice,stream),"upload operand");
-#if FHERMA_COMPUTE_GRAPHS
-        if(operand)s.operand_graph_b.launch(stream);
-        else s.operand_graph_a.launch(stream);
+        check(ari_wmma_encoder::launch_operand(device,residues,operand,s.packed_inputs.ptr,
+            s.packed_weights.ptr,s.primes.ptr,s.radix.ptr,s.twist.ptr,
+            p.N,p.L,p.logN,p.K,stream),"encode operand");
+#if FHERMA_NTT_TILED
+        // The template selects the number of arrays. The roots select direction.
+        check(ari_tile::transform<false>(residues,nullptr,s.primes.ptr,s.roots.ptr,
+                                        p.N,p.K,stream),"single-operand forward NTT");
 #else
-        enqueue_operand_compute(s,operand,stream);
+        for(unsigned half=1;half<p.N;half*=2){
+            single_stage<<<butterflies,256,0,stream>>>(residues,s.primes.ptr,s.roots.ptr,p.N,half);
+            check(cudaGetLastError(),"single-operand forward stage");
+        }
 #endif
     };
     submit_operand(0,in.a.data.data(),s.stream_a.handle);
@@ -1354,11 +1271,19 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     // This CPU staging copy and the B upload may overlap A's encoder/NTT.
     submit_operand(1,in.b.data.data(),nullptr);
     check(cudaStreamWaitEvent(nullptr,s.forward_a.handle,0),"join A and B before product");
-#if FHERMA_COMPUTE_GRAPHS
-    s.result_graph.launch(nullptr);
+    multiply_reverse<<<grid,256>>>(s.ra.ptr,s.rb.ptr,s.rc.ptr,s.primes.ptr,p.N,p.logN);
+    check(cudaGetLastError(),"multiply launch");
+#if FHERMA_NTT_TILED
+    check(ari_tile::transform<false>(s.rc.ptr,nullptr,s.primes.ptr,s.inverse_roots.ptr,p.N,p.K),"tiled inverse NTT");
 #else
-    enqueue_result_compute(s,nullptr);
+    for(unsigned half=1;half<p.N;half*=2) {
+        single_stage<<<butterflies,256>>>(s.rc.ptr,s.primes.ptr,s.inverse_roots.ptr,p.N,half);
+        check(cudaGetLastError(),"inverse NTT launch");
+    }
 #endif
+    decode<<<grid,256>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
+    check(cudaGetLastError(),"decode launch");
+    check(s.crt->run(s.rc.ptr,s.c.ptr),"CRT launch");
     fherma::Outputs out;out.c.shape={int64_t(p.N),int64_t(p.L)};
 #if FHERMA_PINNED_OUTPUT
     check(cudaMemcpyAsync(s.host_c.ptr,s.c.ptr,bytes,cudaMemcpyDeviceToHost,nullptr),"download staged result");
