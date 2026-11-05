@@ -19,3 +19,9 @@ else()
   set_target_properties(solution PROPERTIES CUDA_ARCHITECTURES OFF)
   target_compile_options(solution PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-arch=${FHERMA_CUDA_ARCH}>)
 endif()
+
+# Development diagnostics only: report profiler executables on the build PATH.
+find_program(FHERMA_NSYS NAMES nsys)
+find_program(FHERMA_NCU NAMES ncu)
+message(STATUS "FHERMA diagnostics nsys_on_PATH=${FHERMA_NSYS}")
+message(STATUS "FHERMA diagnostics ncu_on_PATH=${FHERMA_NCU}")
