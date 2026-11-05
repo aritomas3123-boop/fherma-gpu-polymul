@@ -413,8 +413,6 @@ inline Words reconstruct_one(const HostPlan &p, const u32 *r, std::size_t stride
 namespace fherma_crt {
 // Prime-major input [p][coefficient], coefficient-major canonical output
 // [coefficient][limb]. Threads in a row read neighbouring coefficients.
-constexpr unsigned tile_x = 8;
-constexpr unsigned tile_y = 16;
 
 struct DeviceArgs {
     unsigned n, limbs, bits, count;
@@ -422,6 +420,7 @@ struct DeviceArgs {
     PrimeInfo *primes;
     u32 *weights, *q;
 };
+template<unsigned tile_x,unsigned tile_y>
 __global__ void reconstruct_kernel(DeviceArgs plan, const u32 *residues, u32 *out) {
     extern __shared__ unsigned long long shared[];
     unsigned x = threadIdx.x, y = threadIdx.y;
@@ -456,7 +455,9 @@ __global__ void reconstruct_kernel(DeviceArgs plan, const u32 *residues, u32 *ou
 
 class DevicePlan {
     DeviceArgs args_{};
-    std::size_t shared_ = 0;
+    std::size_t shared_per_column_ = 0;
+    bool supported_[3]={false,false,false};
+    unsigned geometry_=0;
     template<class T> static void upload(T *&dst, const std::vector<T>& src) {
         std::size_t bytes = src.size() * sizeof(T);
         cudaError_t status = cudaMalloc(reinterpret_cast<void **>(&dst), bytes);
@@ -474,13 +475,16 @@ public:
         HostPlan plan = make_plan(n, q, limbs, primes);
         args_.n = n; args_.limbs = limbs; args_.bits = plan.bits;
         args_.count = unsigned(primes.size()); args_.gap = plan.gap;
-        shared_ = tile_x * (2 * sizeof(u64) * limbs + sizeof(u32) * (primes.size() + 1 + limbs + 2));
+        shared_per_column_ = 2 * sizeof(u64) * limbs + sizeof(u32) * (primes.size() + 1 + limbs + 2);
         int device = 0;
         cudaDeviceProp prop{};
         cudaError_t status = cudaGetDevice(&device);
         if (status == cudaSuccess) status = cudaGetDeviceProperties(&prop, device);
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
-        if (shared_ > prop.sharedMemPerBlock) throw std::invalid_argument("CRT tile exceeds shared memory capacity");
+        supported_[0]=shared_per_column_*8<=prop.sharedMemPerBlock && prop.maxThreadsPerBlock>=128;
+        supported_[1]=shared_per_column_*16<=prop.sharedMemPerBlock && prop.maxThreadsPerBlock>=128;
+        supported_[2]=shared_per_column_*16<=prop.sharedMemPerBlock && prop.maxThreadsPerBlock>=256;
+        if (!supported_[0]) throw std::invalid_argument("CRT tile exceeds device resource capacity");
         try { upload(args_.primes, plan.primes); upload(args_.weights, plan.weights); upload(args_.q, plan.q); }
         catch (...) { release(); throw; }
     }
@@ -488,9 +492,20 @@ public:
     DevicePlan& operator=(const DevicePlan&) = delete;
     ~DevicePlan() { release(); }
     // Asynchronous, caller checks eventual execution status when consuming out.
-    cudaError_t run(const u32 *residues, u32 *out, cudaStream_t stream = nullptr) const {
-        reconstruct_kernel<<<(args_.n + tile_x - 1) / tile_x, dim3(tile_x, tile_y), shared_, stream>>>(args_, residues, out);
+    bool geometry_supported(unsigned id) const {return id<3 && supported_[id];}
+    void select_geometry(unsigned id){
+        if(!geometry_supported(id))throw std::invalid_argument("unsupported CRT geometry");
+        geometry_=id;
+    }
+    cudaError_t run_geometry(const u32 *residues,u32 *out,unsigned id,cudaStream_t stream=nullptr) const {
+        if(!geometry_supported(id))return cudaErrorInvalidValue;
+        if(id==0)reconstruct_kernel<8,16><<<(args_.n+7)/8,dim3(8,16),shared_per_column_*8,stream>>>(args_,residues,out);
+        else if(id==1)reconstruct_kernel<16,8><<<(args_.n+15)/16,dim3(16,8),shared_per_column_*16,stream>>>(args_,residues,out);
+        else reconstruct_kernel<16,16><<<(args_.n+15)/16,dim3(16,16),shared_per_column_*16,stream>>>(args_,residues,out);
         return cudaGetLastError();
+    }
+    cudaError_t run(const u32 *residues,u32 *out,cudaStream_t stream=nullptr) const {
+        return run_geometry(residues,out,geometry_,stream);
     }
 };
 } // namespace fherma_crt
@@ -1041,6 +1056,16 @@ public:
 #include <cstdio>
 #include <system_error>
 
+#ifndef FHERMA_CRT_AUTOTUNE
+#define FHERMA_CRT_AUTOTUNE 1
+#endif
+#ifndef FHERMA_CRT_TUNE_BUDGET_MS
+#define FHERMA_CRT_TUNE_BUDGET_MS 1000
+#endif
+#ifndef FHERMA_CRT_TUNE_MIN_N
+#define FHERMA_CRT_TUNE_MIN_N 1024
+#endif
+
 namespace {
 void check(cudaError_t e,const char* where) {
     if(e!=cudaSuccess) throw std::runtime_error(std::string(where)+": "+cudaGetErrorString(e));
@@ -1209,6 +1234,167 @@ void choose_staging(State& s,size_t words){
     std::fprintf(stderr," selected_t=%u selected_input=%s\n",best_count,best_wc?"wc":"cached");
 }
 
+// This helper uses only State-owned scratch and public Point parameters in init.
+namespace ari_crt_tune {
+using Clock=std::chrono::steady_clock;
+using Words=std::vector<uint32_t>;
+constexpr unsigned patterns=64;
+inline uint32_t random_word(uint32_t& seed){seed^=seed<<13;seed^=seed>>17;seed^=seed<<5;return seed;}
+inline bool ge(const Words& a,const Words& b){
+    for(size_t i=a.size();i-- >0;)if(a[i]!=b[i])return a[i]>b[i];
+    return true;
+}
+inline Words difference(const Words& a,const Words& b){
+    Words out(a.size());uint64_t borrow=0;
+    for(size_t i=0;i<a.size();++i){const uint64_t sub=uint64_t(b[i])+borrow;
+        out[i]=uint32_t(uint64_t(a[i])-sub);borrow=uint64_t(a[i])<sub;}
+    if(borrow)throw std::logic_error("synthetic subtraction underflow");
+    return out;
+}
+inline uint32_t modulo(const Words& value,uint32_t prime){
+    uint64_t rem=0;for(size_t i=value.size();i-- >0;)rem=((rem<<32)|value[i])%prime;
+    return uint32_t(rem);
+}
+struct Dataset {
+    std::vector<uint32_t> residues;
+    std::array<Words,patterns> expected;
+    std::vector<unsigned> pattern;
+};
+inline Dataset make_dataset(const ari::Plan& plan,const Words& q,uint32_t seed){
+    Dataset data;const unsigned n=plan.N,l=plan.L,k=plan.K;
+    unsigned bits=32*l;while(bits && !(q[(bits-1)/32]&(uint32_t(1)<<((bits-1)%32))))--bits;
+    std::vector<uint32_t> bank(size_t(k)*patterns);
+    Words one(l,0);one[0]=1;
+    for(unsigned index=0;index<patterns;++index){
+        Words value(l,0);
+        if(index==1)value=one;
+        else if(index==2)value=difference(q,one);
+        else if(index>2){
+            for(auto& word:value)word=random_word(seed);
+            for(unsigned limb=(bits+31)/32;limb<l;++limb)value[limb]=0;
+            if(bits%32)value[bits/32]&=(uint32_t(1)<<(bits%32))-1;
+            if(ge(value,q))value=difference(value,q);
+        }
+        const bool negative=(index&1)!=0;
+        bool nonzero=false;for(auto word:value)nonzero|=word!=0;
+        data.expected[index]=negative&&nonzero?difference(q,value):value;
+        for(unsigned j=0;j<k;++j){
+            const auto p=plan.primes[j].p;const auto residue=modulo(value,p);
+            bank[size_t(j)*patterns+index]=negative&&residue?p-residue:residue;
+        }
+    }
+    data.pattern.resize(n);
+    for(unsigned row=0;row<n;++row)data.pattern[row]=row<patterns?row:random_word(seed)%patterns;
+    data.residues.resize(size_t(n)*k);
+    for(unsigned j=0;j<k;++j)for(unsigned row=0;row<n;++row)
+        data.residues[size_t(j)*n+row]=bank[size_t(j)*patterns+data.pattern[row]];
+    return data;
+}
+inline bool oracle_samples(const Dataset& data,const std::vector<uint32_t>& output,unsigned n,unsigned l){
+    for(unsigned sample=0;sample<std::min(n,32u);++sample){
+        const unsigned row=sample==0?n-1:(sample==1?0:unsigned(uint64_t(sample)*(n-1)/31));
+        const auto& expected=data.expected[data.pattern[row]];
+        if(!std::equal(expected.begin(),expected.end(),output.begin()+size_t(row)*l))return false;
+    }
+    return true;
+}
+template<size_t N> inline double median(std::array<double,N> values){
+    std::sort(values.begin(),values.end());return (values[(N-1)/2]+values[N/2])*.5;
+}
+struct Evidence {double ratio=1;bool stable=false;};
+template<size_t Pairs,class Measure> Evidence paired_abba(unsigned candidate,Measure measure){
+    std::array<double,Pairs> ratios{};
+    double low=std::numeric_limits<double>::infinity(),high=0;
+    double candidate_low=std::numeric_limits<double>::infinity(),candidate_high=0;
+    for(size_t pair=0;pair<Pairs;++pair){
+        const double a1=measure(0),b1=measure(candidate),b2=measure(candidate),a2=measure(0);
+        if(!(a1>0&&a2>0&&b1>0&&b2>0))return {};
+        low=std::min(low,std::min(a1,a2));high=std::max(high,std::max(a1,a2));
+        candidate_low=std::min(candidate_low,std::min(b1,b2));candidate_high=std::max(candidate_high,std::max(b1,b2));
+        ratios[pair]=(b1+b2)/(a1+a2);
+    }
+    return {median(ratios),high<=low*1.20&&candidate_high<=candidate_low*1.20};
+}
+struct Events {
+    cudaEvent_t start=nullptr,end=nullptr;
+    Events(){try{check(cudaEventCreate(&start),"create CRT tune start");check(cudaEventCreate(&end),"create CRT tune end");}
+        catch(...){if(start)cudaEventDestroy(start);if(end)cudaEventDestroy(end);throw;}}
+    ~Events(){if(start)cudaEventDestroy(start);if(end)cudaEventDestroy(end);}
+};
+struct Timeout {};
+inline const char* name(unsigned geometry){return geometry==0?"8x16":geometry==1?"16x8":"16x16";}
+} // namespace ari_crt_tune
+
+void choose_crt_geometry(State& s,const fherma::Point& point){
+#if FHERMA_CRT_AUTOTUNE
+    using namespace ari_crt_tune;
+    s.crt->select_geometry(0);
+    if(point.N<FHERMA_CRT_TUNE_MIN_N){
+        std::fprintf(stderr,"ARI_CRT_AUTOTUNE selected=8x16 reason=small_public_N\n");return;
+    }
+    const auto started=Clock::now();
+    auto deadline=[&]{if(std::chrono::duration<double,std::milli>(Clock::now()-started).count()>FHERMA_CRT_TUNE_BUDGET_MS)throw Timeout{};};
+    try{
+        Events events;
+        std::vector<uint32_t> reference(size_t(point.N)*point.L),output(reference.size());
+        auto dataset=make_dataset(s.plan,point.q.data,0x752ba193u);
+        auto upload=[&]{
+            deadline();check(cudaMemcpy(s.rc.ptr,dataset.residues.data(),dataset.residues.size()*sizeof(uint32_t),cudaMemcpyHostToDevice),"upload synthetic CRT residues");
+            // Pageable H2D may return after staging: drain before another deadline
+            // can return the fallback and leave synthetic work before the first run.
+            check(cudaStreamSynchronize(nullptr),"complete synthetic CRT upload");
+        };
+        auto read=[&](unsigned geometry,std::vector<uint32_t>& result,const std::vector<uint32_t>* expected_reference=nullptr){
+            deadline();
+            if(expected_reference){
+                for(size_t i=0;i<result.size();++i)result[i]=~(*expected_reference)[i];
+                check(cudaMemcpy(s.c.ptr,result.data(),result.size()*sizeof(uint32_t),cudaMemcpyHostToDevice),"poison candidate CRT output");
+            }else check(cudaMemset(s.c.ptr,0xff,result.size()*sizeof(uint32_t)),"poison default CRT output");
+            check(s.crt->run_geometry(s.rc.ptr,s.c.ptr,geometry),"synthetic CRT correctness launch");
+            check(cudaMemcpy(result.data(),s.c.ptr,result.size()*sizeof(uint32_t),cudaMemcpyDeviceToHost),"read synthetic CRT result");
+            return oracle_samples(dataset,result,point.N,point.L);
+        };
+        auto measure=[&](unsigned geometry){
+            deadline();check(cudaEventRecord(events.start,nullptr),"start CRT tune timing");
+            check(s.crt->run_geometry(s.rc.ptr,s.c.ptr,geometry),"CRT tune launch");
+            check(cudaEventRecord(events.end,nullptr),"end CRT tune timing");
+            check(cudaEventSynchronize(events.end),"complete CRT tune timing");
+            float ms=0;check(cudaEventElapsedTime(&ms,events.start,events.end),"read CRT tune timing");return double(ms);
+        };
+        upload();
+        if(!read(0,reference))throw std::runtime_error("default CRT failed independent synthetic oracle");
+        (void)measure(0);(void)measure(0);
+        unsigned selected=0;double train_ratio=1;
+        for(unsigned candidate=1;candidate<3;++candidate){
+            if(!s.crt->geometry_supported(candidate))continue;
+            if(!read(candidate,output,&reference)||output!=reference){
+                std::fprintf(stderr,"ARI_CRT_AUTOTUNE candidate=%s rejected=exactness\n",name(candidate));continue;}
+            (void)measure(candidate);(void)measure(candidate);
+            const auto result=paired_abba<5>(candidate,measure);
+            std::fprintf(stderr,"ARI_CRT_AUTOTUNE candidate=%s train_ratio=%.6f pairs=5 stable=%d\n",name(candidate),result.ratio,int(result.stable));
+            if(result.stable&&result.ratio<.95&&result.ratio<train_ratio){selected=candidate;train_ratio=result.ratio;}
+        }
+        if(!selected){std::fprintf(stderr,"ARI_CRT_AUTOTUNE selected=8x16 reason=no_stable_train_gain\n");return;}
+        dataset=make_dataset(s.plan,point.q.data,0x9e5714d3u);upload();
+        if(!read(0,reference))throw std::runtime_error("default CRT failed holdout synthetic oracle");
+        if(!read(selected,output,&reference)||output!=reference){
+            std::fprintf(stderr,"ARI_CRT_AUTOTUNE selected=8x16 reason=holdout_exactness\n");return;}
+        (void)measure(0);(void)measure(selected);
+        const auto holdout=paired_abba<3>(selected,measure);
+        const bool accept=holdout.stable&&holdout.ratio<.95;
+        s.crt->select_geometry(accept?selected:0);
+        std::fprintf(stderr,"ARI_CRT_AUTOTUNE selected=%s train_ratio=%.6f holdout_ratio=%.6f pairs=3 stable=%d reason=%s\n",
+            name(accept?selected:0),train_ratio,holdout.ratio,int(holdout.stable),accept?"paired_holdout_gain":"holdout_default");
+    }catch(const Timeout&){
+        s.crt->select_geometry(0);std::fprintf(stderr,"ARI_CRT_AUTOTUNE selected=8x16 reason=setup_budget\n");
+    }catch(const std::bad_alloc&){
+        s.crt->select_geometry(0);std::fprintf(stderr,"ARI_CRT_AUTOTUNE selected=8x16 reason=owned_host_allocation\n");
+    }
+#else
+    (void)s;(void)point;
+#endif
+}
+
 } // namespace
 
 void* fherma_init(const fherma::Point& p) {
@@ -1231,6 +1417,7 @@ void* fherma_init(const fherma::Point& p) {
     s->crt=std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes);
     check(cudaDeviceSynchronize(),"initialize GPU");
     choose_staging(*s,words);
+    choose_crt_geometry(*s,p);
     return s.release();
 }
 
