@@ -607,6 +607,12 @@ inline cudaError_t transform(uint32_t *a, uint32_t *b, const ari::Prime *primes,
 #include <stdexcept>
 #include <string>
 #include <cstring>
+#ifndef FHERMA_REGISTER_INPUT
+#define FHERMA_REGISTER_INPUT 1
+#endif
+#ifndef FHERMA_REGISTER_OUTPUT
+#define FHERMA_REGISTER_OUTPUT 1
+#endif
 #ifndef FHERMA_PINNED_INPUT
 #define FHERMA_PINNED_INPUT 1
 #endif
@@ -746,6 +752,85 @@ inline cudaError_t launch(uint32_t *a,uint32_t *b,
 #define FHERMA_NTT_TILED 1
 #endif
 
+#include <algorithm>
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <unistd.h>
+
+// This helper borrows byte ranges only for one fherma_run. The caller must
+// complete its CUDA stream before releasing registrations. Declare it after
+// the output vector and before RunFence so exception unwinding synchronizes,
+// unregisters, then destroys the output vector, in that order.
+namespace ari_registration {
+class Regions {
+    struct Range { std::uintptr_t begin=0,end=0; };
+    std::array<Range,3> ranges_{};
+    std::array<void*,3> owned_{};
+    unsigned count_=0;
+    std::uintptr_t page_=0;
+    static void checked(cudaError_t status,const char* where) {
+        if(status!=cudaSuccess)
+            throw std::runtime_error(std::string(where)+": "+cudaGetErrorString(status));
+    }
+public:
+    Regions() {
+        const long page=::sysconf(_SC_PAGESIZE);
+        if(page<=0 || (page&(page-1)))
+            throw std::runtime_error("unsupported host page size");
+        page_=std::uintptr_t(page);
+    }
+    Regions(const Regions&)=delete;
+    Regions& operator=(const Regions&)=delete;
+    ~Regions() {
+        // Best-effort cleanup on a CUDA failure; normal release below checks
+        // every unregister status and never caches a borrowed address.
+        for(auto& pointer:owned_)if(pointer)cudaHostUnregister(pointer);
+    }
+    void add(const void* pointer,std::size_t bytes) {
+        if(!bytes)return;
+        if(!pointer || count_==ranges_.size())
+            throw std::invalid_argument("invalid host registration range");
+        const auto address=reinterpret_cast<std::uintptr_t>(pointer);
+        const auto max=std::numeric_limits<std::uintptr_t>::max();
+        if(bytes>max-address || address+bytes>max-(page_-1))
+            throw std::invalid_argument("host registration address overflow");
+        // Register only pages intersecting the borrowed arrays. Merge pages
+        // shared by separate arrays or aliased operands before registration.
+        ranges_[count_++]={address&~(page_-1),(address+bytes+page_-1)&~(page_-1)};
+    }
+    void acquire() {
+        std::sort(ranges_.begin(),ranges_.begin()+count_,
+                  [](const Range& a,const Range& b){return a.begin<b.begin;});
+        unsigned merged=0;
+        for(unsigned i=0;i<count_;++i){
+            if(merged && ranges_[i].begin<=ranges_[merged-1].end)
+                ranges_[merged-1].end=std::max(ranges_[merged-1].end,ranges_[i].end);
+            else ranges_[merged++]=ranges_[i];
+        }
+        count_=merged;
+        for(unsigned i=0;i<count_;++i){
+            void* pointer=reinterpret_cast<void*>(ranges_[i].begin);
+            checked(cudaHostRegister(pointer,ranges_[i].end-ranges_[i].begin,
+                                     cudaHostRegisterDefault),"register measured host pages");
+            owned_[i]=pointer;
+        }
+    }
+    void release() {
+        cudaError_t first=cudaSuccess;
+        for(auto& pointer:owned_)if(pointer){
+            const auto status=cudaHostUnregister(pointer);
+            if(status==cudaSuccess)pointer=nullptr;
+            else if(first==cudaSuccess)first=status;
+        }
+        checked(first,"unregister measured host pages");
+    }
+};
+} // namespace ari_registration
+
 namespace {
 void check(cudaError_t e,const char* where) {
     if(e!=cudaSuccess) throw std::runtime_error(std::string(where)+": "+cudaGetErrorString(e));
@@ -813,15 +898,66 @@ __global__ void decode(uint32_t* a,const ari::Prime* primes,const uint32_t* untw
     const size_t at=size_t(k)*N+i;const auto p=primes[k];
     a[at]=ari::mont(ari::mont(a[at],untwist[at],p),1,p);
 }
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdio>
+#include <vector>
+
+#ifndef FHERMA_REGISTRATION_DIAGNOSTIC
+#define FHERMA_REGISTRATION_DIAGNOSTIC 1
+#endif
+#if FHERMA_REGISTRATION_DIAGNOSTIC
+namespace ari_registration_profile {
+using Clock=std::chrono::steady_clock;
+using Marks=std::array<Clock::time_point,8>;
+class Profile {
+    static constexpr unsigned limit=128;
+    std::vector<std::array<double,8>> calls_;
+    static double ms(Clock::duration d){
+        return std::chrono::duration<double,std::milli>(d).count();
+    }
+public:
+    Profile(){calls_.reserve(limit);}
+    void capture(const Marks& times) noexcept {
+        if(calls_.size()==calls_.capacity())return;
+        std::array<double,8> row{};
+        for(unsigned i=0;i<7;++i)row[i]=ms(times[i+1]-times[i]);
+        row[7]=ms(times[7]-times[0]);
+        calls_.push_back(row);
+    }
+    void report(unsigned n,unsigned w) const {
+        if(calls_.empty())return;
+        const char* names[]={"output_allocate","register","input_submit",
+            "compute_submit","output_prepare_submit","output_wait_construct",
+            "unregister","call_total"};
+        std::fprintf(stderr,"ari_registration_cpu_wall N=%u W=%u calls=%zu median_ms",n,w,calls_.size());
+        for(unsigned col=0;col<8;++col){
+            std::array<double,limit> samples{};
+            for(std::size_t i=0;i<calls_.size();++i)samples[i]=calls_[i][col];
+            std::sort(samples.begin(),samples.begin()+calls_.size());
+            const auto size=calls_.size();
+            const double median=(samples[(size-1)/2]+samples[size/2])*0.5;
+            std::fprintf(stderr," %s=%.6f",names[col],median);
+        }
+        std::fprintf(stderr,"\n");std::fflush(stderr);
+    }
+};
+} // namespace ari_registration_profile
+#endif
+
 struct State {
     ari::Plan plan;
+#if FHERMA_REGISTRATION_DIAGNOSTIC
+    ari_registration_profile::Profile profile;
+#endif
     Buffer<uint32_t> a,b,c,ra,rb,rc,roots,inverse_roots,twist,untwist;
     Buffer<ari::Prime> primes;
     Buffer<ari_shoup::Weight> weights;
-#if FHERMA_PINNED_INPUT
+#if FHERMA_PINNED_INPUT && !FHERMA_REGISTER_INPUT
     HostBuffer<uint32_t> host_a,host_b;
 #endif
-#if FHERMA_PINNED_OUTPUT
+#if FHERMA_PINNED_OUTPUT && !FHERMA_REGISTER_OUTPUT
     HostBuffer<uint32_t> host_c;
 #endif
     std::unique_ptr<fherma_crt::DevicePlan> crt;
@@ -833,11 +969,11 @@ void* fherma_init(const fherma::Point& p) {
     auto s=std::make_unique<State>(p);
     const size_t words=size_t(p.N)*p.L, residues=size_t(p.N)*s->plan.K;
     s->a.alloc(words);s->b.alloc(words);s->c.alloc(words);
-#if FHERMA_PINNED_INPUT
+#if FHERMA_PINNED_INPUT && !FHERMA_REGISTER_INPUT
     const unsigned host_flags=FHERMA_INPUT_WRITE_COMBINED?cudaHostAllocWriteCombined:cudaHostAllocDefault;
     s->host_a.alloc(words,host_flags);s->host_b.alloc(words,host_flags);
 #endif
-#if FHERMA_PINNED_OUTPUT
+#if FHERMA_PINNED_OUTPUT && !FHERMA_REGISTER_OUTPUT
     // Output is cacheable: the CPU must read it when constructing the vector.
     s->host_c.alloc(words);
 #endif
@@ -855,8 +991,36 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     auto& s=*static_cast<State*>(state);const auto& p=s.plan;
     const size_t words=size_t(p.N)*p.L,bytes=words*sizeof(uint32_t);
     if(in.a.data.size()!=words||in.b.data.size()!=words)throw std::runtime_error("input size does not match point");
+#if FHERMA_REGISTRATION_DIAGNOSTIC
+    ari_registration_profile::Marks measured;
+    measured[0]=ari_registration_profile::Clock::now();
+#endif
+    fherma::Outputs out;out.c.shape={int64_t(p.N),int64_t(p.L)};
+#if FHERMA_REGISTER_OUTPUT
+    // Construct all returned vector elements before registering their pages.
+    // Both allocation/initialization and registration remain inside the clock.
+    out.c.data.resize(words);
+#endif
+#if FHERMA_REGISTRATION_DIAGNOSTIC
+    measured[1]=ari_registration_profile::Clock::now();
+#endif
+    ari_registration::Regions registered;
+#if FHERMA_REGISTER_INPUT
+    registered.add(in.a.data.data(),bytes);
+    registered.add(in.b.data.data(),bytes);
+#endif
+#if FHERMA_REGISTER_OUTPUT
+    registered.add(out.c.data.data(),bytes);
+#endif
+    registered.acquire();
+#if FHERMA_REGISTRATION_DIAGNOSTIC
+    measured[2]=ari_registration_profile::Clock::now();
+#endif
     RunFence fence;
-#if FHERMA_PINNED_INPUT
+#if FHERMA_REGISTER_INPUT
+    check(cudaMemcpyAsync(s.a.ptr,in.a.data.data(),bytes,cudaMemcpyHostToDevice,nullptr),"upload registered a");
+    check(cudaMemcpyAsync(s.b.ptr,in.b.data.data(),bytes,cudaMemcpyHostToDevice,nullptr),"upload registered b");
+#elif FHERMA_PINNED_INPUT
     std::memcpy(s.host_a.ptr,in.a.data.data(),bytes);
     check(cudaMemcpyAsync(s.a.ptr,s.host_a.ptr,bytes,cudaMemcpyHostToDevice,nullptr),"upload staged a");
     // This host copy can overlap the preceding A DMA. B is not enqueued
@@ -866,6 +1030,9 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
 #else
     check(cudaMemcpy(s.a.ptr,in.a.data.data(),bytes,cudaMemcpyHostToDevice),"upload a");
     check(cudaMemcpy(s.b.ptr,in.b.data.data(),bytes,cudaMemcpyHostToDevice),"upload b");
+#endif
+#if FHERMA_REGISTRATION_DIAGNOSTIC
+    measured[3]=ari_registration_profile::Clock::now();
 #endif
     const dim3 grid((p.N+255)/256,p.K);
 #if !FHERMA_NTT_TILED
@@ -894,11 +1061,22 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     decode<<<grid,256>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
     check(cudaGetLastError(),"decode launch");
     check(s.crt->run(s.rc.ptr,s.c.ptr),"CRT launch");
-    fherma::Outputs out;out.c.shape={int64_t(p.N),int64_t(p.L)};
-#if FHERMA_PINNED_OUTPUT
+#if FHERMA_REGISTRATION_DIAGNOSTIC
+    measured[4]=ari_registration_profile::Clock::now();
+#endif
+#if FHERMA_REGISTER_OUTPUT
+    check(cudaMemcpyAsync(out.c.data.data(),s.c.ptr,bytes,cudaMemcpyDeviceToHost,nullptr),"download registered result");
+#if FHERMA_REGISTRATION_DIAGNOSTIC
+    measured[5]=ari_registration_profile::Clock::now();
+#endif
+    fence.complete();
+#elif FHERMA_PINNED_OUTPUT
     // Allocate the returned vector's storage while preceding GPU kernels run,
     // but do not create/zero its elements before the result arrives.
     check(cudaMemcpyAsync(s.host_c.ptr,s.c.ptr,bytes,cudaMemcpyDeviceToHost,nullptr),"download staged result");
+#if FHERMA_REGISTRATION_DIAGNOSTIC
+    measured[5]=ari_registration_profile::Clock::now();
+#endif
     out.c.data.reserve(words);
     fence.complete();
     // Range initialization writes final values directly instead of first
@@ -906,9 +1084,28 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     out.c.data.assign(s.host_c.ptr,s.host_c.ptr+words);
 #else
     out.c.data.resize(words);
+#if FHERMA_REGISTRATION_DIAGNOSTIC
+    measured[5]=ari_registration_profile::Clock::now();
+#endif
     check(cudaMemcpy(out.c.data.data(),s.c.ptr,bytes,cudaMemcpyDeviceToHost),"download result");
     fence.completed=true; // Blocking D2H completed all preceding stream work.
 #endif
+    // Complete all DMA before unregistering. No borrowed address survives
+    // this call, even when the harness allocates different buffers next time.
+#if FHERMA_REGISTRATION_DIAGNOSTIC
+    measured[6]=ari_registration_profile::Clock::now();
+#endif
+    registered.release();
+#if FHERMA_REGISTRATION_DIAGNOSTIC
+    measured[7]=ari_registration_profile::Clock::now();
+    s.profile.capture(measured);
+#endif
     return out;
 }
-void fherma_free(void* state) {delete static_cast<State*>(state);}
+void fherma_free(void* state) {
+    auto* s=static_cast<State*>(state);
+#if FHERMA_REGISTRATION_DIAGNOSTIC
+    if(s)s->profile.report(s->plan.N,s->plan.W);
+#endif
+    delete s;
+}
