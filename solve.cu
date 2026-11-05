@@ -2,6 +2,11 @@
 // RNS NTT + centered CRT. Initial GPU implementation; validation pending.
 // Interface/harness: https://github.com/fherma-ai/polynomial-mult-cupqc-example
 #include "fherma.h"
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstdio>
+#include <vector>
 
 // ---- rns_core.h ----
 #include <cstdint>
@@ -898,12 +903,6 @@ __global__ void decode(uint32_t* a,const ari::Prime* primes,const uint32_t* untw
     const size_t at=size_t(k)*N+i;const auto p=primes[k];
     a[at]=ari::mont(ari::mont(a[at],untwist[at],p),1,p);
 }
-#include <algorithm>
-#include <array>
-#include <chrono>
-#include <cstdio>
-#include <vector>
-
 #ifndef FHERMA_REGISTRATION_DIAGNOSTIC
 #define FHERMA_REGISTRATION_DIAGNOSTIC 1
 #endif
