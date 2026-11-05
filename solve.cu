@@ -413,7 +413,7 @@ inline Words reconstruct_one(const HostPlan &p, const u32 *r, std::size_t stride
 namespace fherma_crt {
 // Prime-major input [p][coefficient], coefficient-major canonical output
 // [coefficient][limb]. Threads in a row read neighbouring coefficients.
-constexpr unsigned tile_x = 16;
+constexpr unsigned tile_x = 8;
 constexpr unsigned tile_y = 16;
 
 struct DeviceArgs {
