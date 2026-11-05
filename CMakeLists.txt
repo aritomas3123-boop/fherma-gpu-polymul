@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 project(fherma_solution LANGUAGES CXX)
+find_package(Threads REQUIRED)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
@@ -19,3 +20,5 @@ else()
   set_target_properties(solution PROPERTIES CUDA_ARCHITECTURES OFF)
   target_compile_options(solution PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-arch=${FHERMA_CUDA_ARCH}>)
 endif()
+
+target_link_libraries(solution PRIVATE Threads::Threads)
