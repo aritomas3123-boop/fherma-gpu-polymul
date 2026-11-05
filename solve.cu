@@ -923,6 +923,13 @@ inline cudaError_t launch_operand(const std::uint32_t *input,std::uint32_t *resi
 #ifndef FHERMA_NTT_TILED
 #define FHERMA_NTT_TILED 1
 #endif
+#ifndef FHERMA_TRANSFER_GRAPH
+#define FHERMA_TRANSFER_GRAPH 1
+#endif
+#if FHERMA_TRANSFER_GRAPH && (!FHERMA_PINNED_INPUT || !FHERMA_PINNED_OUTPUT)
+#error "The complete transfer graph requires State-owned pinned input and output staging"
+#endif
+#include <exception>
 
 #include <algorithm>
 #include <atomic>
@@ -1119,6 +1126,49 @@ __global__ void decode(uint32_t* a,const ari::Prime* primes,const uint32_t* untw
     const size_t at=size_t(k)*N+i;const auto p=primes[k];
     a[at]=ari::mont(ari::mont(a[at],untwist[at],p),1,p);
 }
+#if FHERMA_TRANSFER_GRAPH
+struct GraphHandle {
+    cudaGraph_t handle=nullptr;
+    GraphHandle()=default;
+    GraphHandle(const GraphHandle&)=delete;
+    ~GraphHandle(){if(handle)cudaGraphDestroy(handle);}
+    template<class Launcher> void capture(cudaStream_t stream,Launcher launcher){
+        check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal),"begin child capture");
+        bool capturing=true;
+        cudaGraph_t captured=nullptr;
+        try{
+            launcher();
+            const auto status=cudaStreamEndCapture(stream,&captured);
+            capturing=false;
+            check(status,"end child capture");
+            handle=captured;
+        }catch(...){
+            if(capturing){
+                cudaGraph_t discarded=nullptr;
+                (void)cudaStreamEndCapture(stream,&discarded);
+                if(discarded)cudaGraphDestroy(discarded);
+            }
+            if(captured)cudaGraphDestroy(captured);
+            throw;
+        }
+    }
+};
+struct TransferGraph {
+    // Declared before graph handles: destroyed last. State declares this
+    // owner after all referenced allocations, the Team and callback fields.
+    OperandStream launch_stream;
+    GraphHandle child_a,child_b,child_result,parent;
+    cudaGraphExec_t executable=nullptr;
+    TransferGraph()=default;
+    TransferGraph(const TransferGraph&)=delete;
+    ~TransferGraph(){
+        if(launch_stream.handle)(void)cudaStreamSynchronize(launch_stream.handle);
+        if(executable)cudaGraphExecDestroy(executable);
+        // Then parent/children are destroyed, then launch_stream.
+    }
+};
+#endif
+
 struct State {
     ari::Plan plan;
     OperandStream stream_a;
@@ -1136,8 +1186,154 @@ struct State {
     HostBuffer<uint32_t> host_c;
 #endif
     std::unique_ptr<fherma_crt::DevicePlan> crt;
+#if FHERMA_TRANSFER_GRAPH
+    // Only this pointer is borrowed, only during one fherma_run. The graph's
+    // stored pointers otherwise refer exclusively to State-owned memory.
+    std::atomic<const uint32_t*> borrowed_b{nullptr};
+    std::atomic<bool> callback_failed{false};
+    std::exception_ptr callback_error;
+    TransferGraph transfer;
+#endif
     explicit State(const fherma::Point& p):plan(p){}
 };
+
+#if FHERMA_TRANSFER_GRAPH
+void enqueue_graph_operand(State& s,unsigned operand,cudaStream_t stream){
+    const auto& p=s.plan;
+    uint32_t* device=operand?s.b.ptr:s.a.ptr;
+    uint32_t* residues=operand?s.rb.ptr:s.ra.ptr;
+    check(ari_wmma_encoder::launch_operand(device,residues,operand,s.packed_inputs.ptr,
+        s.packed_weights.ptr,s.primes.ptr,s.radix.ptr,s.twist.ptr,
+        p.N,p.L,p.logN,p.K,stream),"capture operand encode");
+#if FHERMA_NTT_TILED
+    check(ari_tile::transform<false>(residues,nullptr,s.primes.ptr,s.roots.ptr,
+        p.N,p.K,stream),"capture forward NTT");
+#else
+    const dim3 butterflies((p.N/2+255)/256,p.K);
+    for(unsigned half=1;half<p.N;half*=2){
+        single_stage<<<butterflies,256,0,stream>>>(residues,s.primes.ptr,s.roots.ptr,p.N,half);
+        check(cudaGetLastError(),"capture forward stage");
+    }
+#endif
+}
+void enqueue_graph_result(State& s,cudaStream_t stream){
+    const auto& p=s.plan;
+    const dim3 grid((p.N+255)/256,p.K);
+    multiply_reverse<<<grid,256,0,stream>>>(s.ra.ptr,s.rb.ptr,s.rc.ptr,s.primes.ptr,p.N,p.logN);
+    check(cudaGetLastError(),"capture product");
+#if FHERMA_NTT_TILED
+    check(ari_tile::transform<false>(s.rc.ptr,nullptr,s.primes.ptr,s.inverse_roots.ptr,
+        p.N,p.K,stream),"capture inverse NTT");
+#else
+    const dim3 butterflies((p.N/2+255)/256,p.K);
+    for(unsigned half=1;half<p.N;half*=2){
+        single_stage<<<butterflies,256,0,stream>>>(s.rc.ptr,s.primes.ptr,s.inverse_roots.ptr,p.N,half);
+        check(cudaGetLastError(),"capture inverse stage");
+    }
+#endif
+    decode<<<grid,256,0,stream>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
+    check(cudaGetLastError(),"capture decode");
+    check(s.crt->run(s.rc.ptr,s.c.ptr,stream),"capture CRT");
+}
+// CUDA host callbacks must not call any CUDA API, including indirectly.
+// Team::copy is CPU-only (memcpy/SFENCE, atomics, mutex/CV and worker threads).
+void CUDART_CB graph_copy_b(void* context) noexcept {
+    auto& s=*static_cast<State*>(context);
+    try{
+        const auto* input=s.borrowed_b.load(std::memory_order_acquire);
+        if(!input)throw std::runtime_error("missing per-call operand B");
+        s.copy_team->copy(s.host_b.ptr,input,size_t(s.plan.N)*s.plan.L,s.input_wc);
+    }catch(...){
+        s.callback_error=std::current_exception();
+        s.callback_failed.store(true,std::memory_order_release);
+    }
+}
+struct GraphCounts {
+    size_t kernels=0,h2d=0,d2h=0,host=0,children=0,other=0;
+};
+GraphCounts inspect_graph(cudaGraph_t graph){
+    size_t count=0;
+    check(cudaGraphGetNodes(graph,nullptr,&count),"count graph nodes");
+    std::vector<cudaGraphNode_t> nodes(count);
+    check(cudaGraphGetNodes(graph,nodes.data(),&count),"enumerate graph nodes");
+    GraphCounts result;
+    for(const auto node:nodes){
+        cudaGraphNodeType type;
+        check(cudaGraphNodeGetType(node,&type),"inspect graph node type");
+        if(type==cudaGraphNodeTypeKernel)++result.kernels;
+        else if(type==cudaGraphNodeTypeHost)++result.host;
+        else if(type==cudaGraphNodeTypeGraph)++result.children;
+        else if(type==cudaGraphNodeTypeMemcpy){
+            cudaMemcpy3DParms params{};
+            check(cudaGraphMemcpyNodeGetParams(node,&params),"inspect graph copy kind");
+            if(params.kind==cudaMemcpyHostToDevice)++result.h2d;
+            else if(params.kind==cudaMemcpyDeviceToHost)++result.d2h;
+            else ++result.other;
+        }else ++result.other;
+    }
+    return result;
+}
+void prepare_transfer_graph(State& s){
+    const auto stream=s.transfer.launch_stream.handle;
+    // Capture records GPU-only compute without executing it or borrowing data.
+    s.transfer.child_a.capture(stream,[&]{enqueue_graph_operand(s,0,stream);});
+    s.transfer.child_b.capture(stream,[&]{enqueue_graph_operand(s,1,stream);});
+    s.transfer.child_result.capture(stream,[&]{enqueue_graph_result(s,stream);});
+    check(cudaGraphCreate(&s.transfer.parent.handle,0),"create transfer parent graph");
+    const auto graph=s.transfer.parent.handle;
+    const size_t bytes=size_t(s.plan.N)*s.plan.L*sizeof(uint32_t);
+    cudaGraphNode_t upload_a,compute_a,host_b,upload_b,compute_b,result,download;
+    check(cudaGraphAddMemcpyNode1D(&upload_a,graph,nullptr,0,s.a.ptr,s.host_a.ptr,
+        bytes,cudaMemcpyHostToDevice),"add A upload");
+    check(cudaGraphAddChildGraphNode(&compute_a,graph,&upload_a,1,
+        s.transfer.child_a.handle),"add A compute child");
+    cudaHostNodeParams host_params{};
+    host_params.fn=graph_copy_b;host_params.userData=&s;
+    check(cudaGraphAddHostNode(&host_b,graph,nullptr,0,&host_params),"add CPU B copy node");
+    check(cudaGraphAddMemcpyNode1D(&upload_b,graph,&host_b,1,s.b.ptr,s.host_b.ptr,
+        bytes,cudaMemcpyHostToDevice),"add B upload");
+    check(cudaGraphAddChildGraphNode(&compute_b,graph,&upload_b,1,
+        s.transfer.child_b.handle),"add B compute child");
+    const cudaGraphNode_t joined[]={compute_a,compute_b};
+    check(cudaGraphAddChildGraphNode(&result,graph,joined,2,
+        s.transfer.child_result.handle),"add joined result compute child");
+    check(cudaGraphAddMemcpyNode1D(&download,graph,&result,1,s.host_c.ptr,s.c.ptr,
+        bytes,cudaMemcpyDeviceToHost),"add result download");
+    check(cudaGraphInstantiateWithFlags(&s.transfer.executable,graph,0),"instantiate transfer graph");
+    const auto parent=inspect_graph(graph);
+    const auto a=inspect_graph(s.transfer.child_a.handle);
+    const auto b=inspect_graph(s.transfer.child_b.handle);
+    const auto c=inspect_graph(s.transfer.child_result.handle);
+    if(parent.h2d!=2||parent.d2h!=1||parent.host!=1||parent.children!=3||
+       parent.kernels||parent.other)
+        throw std::runtime_error("unexpected complete transfer graph topology");
+    std::fprintf(stderr,"ARI_TRANSFER_GRAPH N=%u H2Dnodes=%zu D2Hnodes=%zu hostnodes=%zu childgraphs=%zu kernel_nodes=%zu graph_launches_per_call=1\n",
+        s.plan.N,parent.h2d,parent.d2h,parent.host,parent.children,a.kernels+b.kernels+c.kernels);
+}
+struct TransferRunGuard {
+    State& state;
+    bool may_have_launched=false;
+    explicit TransferRunGuard(State& s):state(s){}
+    TransferRunGuard(const TransferRunGuard&)=delete;
+    ~TransferRunGuard(){
+        if(may_have_launched)(void)cudaStreamSynchronize(state.transfer.launch_stream.handle);
+        (void)state.callback_failed.load(std::memory_order_acquire);
+        state.borrowed_b.store(nullptr,std::memory_order_release);
+        state.callback_error=nullptr;
+        state.callback_failed.store(false,std::memory_order_relaxed);
+    }
+    void complete(){
+        check(cudaStreamSynchronize(state.transfer.launch_stream.handle),"complete transfer graph");
+        may_have_launched=false;
+        state.borrowed_b.store(nullptr,std::memory_order_release);
+        if(state.callback_failed.load(std::memory_order_acquire)){
+            const auto error=state.callback_error;
+            if(error)std::rethrow_exception(error);
+            throw std::runtime_error("CPU B copy callback failed");
+        }
+    }
+};
+#endif
 // Calibration touches only owned, synthetic point-sized storage. All runtime
 // inputs, outputs, CUDA work and waits remain inside their normal call.
 void choose_staging(State& s,size_t words){
@@ -1231,9 +1427,35 @@ void* fherma_init(const fherma::Point& p) {
     s->crt=std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes);
     check(cudaDeviceSynchronize(),"initialize GPU");
     choose_staging(*s,words);
+#if FHERMA_TRANSFER_GRAPH
+    prepare_transfer_graph(*s);
+#endif
     return s.release();
 }
 
+#if FHERMA_TRANSFER_GRAPH
+fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
+    auto& s=*static_cast<State*>(state);const auto& p=s.plan;
+    const size_t words=size_t(p.N)*p.L;
+    if(in.a.data.size()!=words||in.b.data.size()!=words)
+        throw std::runtime_error("input size does not match point");
+    TransferRunGuard fence(s);
+    s.copy_team->copy(s.host_a.ptr,in.a.data.data(),words,s.input_wc);
+    s.callback_error=nullptr;
+    s.callback_failed.store(false,std::memory_order_relaxed);
+    s.borrowed_b.store(in.b.data.data(),std::memory_order_release);
+    // Fence covers even an API error that follows partial graph submission.
+    fence.may_have_launched=true;
+    check(cudaGraphLaunch(s.transfer.executable,s.transfer.launch_stream.handle),"launch complete transfer graph");
+    fherma::Outputs out;
+    out.c.shape={int64_t(p.N),int64_t(p.L)};
+    out.c.data.resize(words);
+    // Callback B may copy in parallel with the output vector construction.
+    fence.complete();
+    s.copy_team->copy(out.c.data.data(),s.host_c.ptr,words);
+    return out;
+}
+#else
 fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     auto& s=*static_cast<State*>(state);const auto& p=s.plan;
     const size_t words=size_t(p.N)*p.L,bytes=words*sizeof(uint32_t);
@@ -1298,4 +1520,5 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
 #endif
     return out;
 }
+#endif // FHERMA_TRANSFER_GRAPH
 void fherma_free(void* state) {delete static_cast<State*>(state);}
