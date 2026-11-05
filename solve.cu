@@ -422,7 +422,7 @@ struct DeviceArgs {
     PrimeInfo *primes;
     u32 *weights, *q;
 };
-__global__ void reconstruct_kernel(DeviceArgs plan, const u32 *residues, u32 *out) {
+__global__ void reconstruct_kernel(DeviceArgs plan, const u32 *residues, u32 *out, unsigned rows) {
     extern __shared__ unsigned long long shared[];
     unsigned x = threadIdx.x, y = threadIdx.y;
     unsigned coef = blockIdx.x * tile_x + x;
@@ -431,7 +431,7 @@ __global__ void reconstruct_kernel(DeviceArgs plan, const u32 *residues, u32 *ou
     u64 *high = low + l * tile_x;
     u32 *terms = reinterpret_cast<u32 *>(high + l * tile_x);
     u32 *digits = terms + pitch * tile_x;
-    bool active = coef < plan.n;
+    bool active = coef < rows;
     for (unsigned j = y; j < k; j += tile_y) {
         u32 r = active ? residues[std::size_t(j) * plan.n + coef] : 0;
         terms[j * tile_x + x] = weight_residue(r, plan.primes[j]);
@@ -488,8 +488,14 @@ public:
     DevicePlan& operator=(const DevicePlan&) = delete;
     ~DevicePlan() { release(); }
     // Asynchronous, caller checks eventual execution status when consuming out.
-    cudaError_t run(const u32 *residues, u32 *out, cudaStream_t stream = nullptr) const {
-        reconstruct_kernel<<<(args_.n + tile_x - 1) / tile_x, dim3(tile_x, tile_y), shared_, stream>>>(args_, residues, out);
+    cudaError_t run_rows(const u32 *residues, u32 *out, unsigned first, unsigned rows,
+                         cudaStream_t stream = nullptr) const {
+        if (first >= args_.n || rows == 0 || rows > args_.n - first)
+            return cudaErrorInvalidValue;
+        // Keep the full prime-major pitch; each block indexes its own band locally.
+        const unsigned blocks = (rows + tile_x - 1) / tile_x;
+        reconstruct_kernel<<<blocks, dim3(tile_x, tile_y), shared_, stream>>>(
+            args_, residues + first, out + std::size_t(first) * args_.limbs, rows);
         return cudaGetLastError();
     }
 };
@@ -1072,13 +1078,13 @@ struct OperandStream {
     OperandStream(const OperandStream&)=delete;
     ~OperandStream(){if(handle)cudaStreamDestroy(handle);}
 };
-struct ForwardReady {
+struct ReadyEvent {
     cudaEvent_t handle=nullptr;
-    ForwardReady(){
-        check(cudaEventCreateWithFlags(&handle,cudaEventDisableTiming),"create A ready event");
+    ReadyEvent(){
+        check(cudaEventCreateWithFlags(&handle,cudaEventDisableTiming),"create CUDA ready event");
     }
-    ForwardReady(const ForwardReady&)=delete;
-    ~ForwardReady(){if(handle)cudaEventDestroy(handle);}
+    ReadyEvent(const ReadyEvent&)=delete;
+    ~ReadyEvent(){if(handle)cudaEventDestroy(handle);}
 };
 // The normal output stream joins A before pointwise multiplication. Before
 // that join, a partial failure may have submitted work on either stream.
@@ -1122,7 +1128,7 @@ __global__ void decode(uint32_t* a,const ari::Prime* primes,const uint32_t* untw
 struct State {
     ari::Plan plan;
     OperandStream stream_a;
-    ForwardReady forward_a;
+    ReadyEvent forward_a;
     Buffer<uint32_t> a,b,c,ra,rb,rc,roots,inverse_roots,twist,untwist;
     Buffer<ari::Prime> primes;
     Buffer<uint8_t> packed_inputs, packed_weights;
@@ -1134,6 +1140,7 @@ struct State {
 #endif
 #if FHERMA_PINNED_OUTPUT
     HostBuffer<uint32_t> host_c;
+    ReadyEvent crt_ready[2], first_downloaded;
 #endif
     std::unique_ptr<fherma_crt::DevicePlan> crt;
     explicit State(const fherma::Point& p):plan(p){}
@@ -1283,15 +1290,35 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
 #endif
     decode<<<grid,256>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
     check(cudaGetLastError(),"decode launch");
-    check(s.crt->run(s.rc.ptr,s.c.ptr),"CRT launch");
     fherma::Outputs out;out.c.shape={int64_t(p.N),int64_t(p.L)};
 #if FHERMA_PINNED_OUTPUT
-    check(cudaMemcpyAsync(s.host_c.ptr,s.c.ptr,bytes,cudaMemcpyDeviceToHost,nullptr),"download staged result");
-    // Construct elements while D2H and preceding kernels can still run.
+    // All supported N are powers of two >= 2, so two equal bands cover every row.
+    const unsigned rows = p.N / 2;
+    const size_t band_words = size_t(rows) * p.L;
+    // forward_a was recorded before the default stream joined it. A's stream
+    // is now free to download C while the default stream reconstructs later rows.
+    const cudaStream_t download = s.stream_a.handle;
+    for (unsigned band = 0; band < 2; ++band) {
+        const unsigned first = band * rows;
+        const size_t offset = size_t(first) * p.L;
+        check(s.crt->run_rows(s.rc.ptr, s.c.ptr, first, rows), "reconstruct output band");
+        check(cudaEventRecord(s.crt_ready[band].handle, nullptr), "mark CRT band ready");
+        check(cudaStreamWaitEvent(download, s.crt_ready[band].handle, 0), "wait for CRT band");
+        check(cudaMemcpyAsync(s.host_c.ptr + offset, s.c.ptr + offset,
+                              band_words * sizeof(uint32_t), cudaMemcpyDeviceToHost, download),
+              "download output band");
+        if (band == 0)
+            check(cudaEventRecord(s.first_downloaded.handle, download), "mark first download");
+    }
+    // Only State-owned buffers are touched by CUDA. Construct the standard
+    // result vector while work runs, then copy only spans with completed DMA.
     out.c.data.resize(words);
+    check(cudaEventSynchronize(s.first_downloaded.handle), "wait for first download");
+    s.copy_team->copy(out.c.data.data(), s.host_c.ptr, band_words);
     fence.complete();
-    s.copy_team->copy(out.c.data.data(),s.host_c.ptr,words);
+    s.copy_team->copy(out.c.data.data() + band_words, s.host_c.ptr + band_words, band_words);
 #else
+    check(s.crt->run_rows(s.rc.ptr, s.c.ptr, 0, p.N), "CRT launch");
     out.c.data.resize(words);
     check(cudaMemcpy(out.c.data.data(),s.c.ptr,bytes,cudaMemcpyDeviceToHost),"download result");
     fence.complete();
