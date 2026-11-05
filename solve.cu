@@ -746,6 +746,112 @@ inline cudaError_t launch(uint32_t *a,uint32_t *b,
 #define FHERMA_NTT_TILED 1
 #endif
 
+#include <algorithm>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <mutex>
+#include <thread>
+#include <vector>
+#if defined(__linux__)
+#include <sched.h>
+#endif
+
+#ifndef FHERMA_COPY_PARTICIPANTS
+#define FHERMA_COPY_PARTICIPANTS 4
+#endif
+static_assert(FHERMA_COPY_PARTICIPANTS >= 1 && FHERMA_COPY_PARTICIPANTS <= 24,
+              "expected 1..24 copy participants");
+namespace ari_copy {
+inline unsigned concurrency() {
+    unsigned available=std::thread::hardware_concurrency();
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if(sched_getaffinity(0,sizeof(set),&set)==0)
+        available=unsigned(CPU_COUNT(&set));
+#endif
+    return std::max(1u,std::min(unsigned(FHERMA_COPY_PARTICIPANTS),available));
+}
+
+// All public operations are serialized by fherma_run on this State. Workers
+// cannot retain or touch borrowed pointers after copy() releases the caller.
+class Team {
+    std::mutex mu;
+    std::condition_variable wake,done;
+    std::vector<std::thread> workers;
+    uint64_t epoch=0;
+    unsigned pending=0;
+    bool stopping=false;
+    const unsigned participants;
+    const uint32_t* src=nullptr;
+    uint32_t* dst=nullptr;
+    size_t words=0;
+    static void piece(unsigned me,unsigned count,size_t n,uint32_t* d,const uint32_t* s){
+        // Partition cache lines; only the last worker handles the tail.
+        const size_t lines=n/16;
+        const size_t lo=16*(lines*me/count);
+        const size_t hi=me+1==count?n:16*(lines*(me+1)/count);
+        if(hi>lo) std::memcpy(d+lo,s+lo,(hi-lo)*sizeof(uint32_t));
+    }
+    void loop(unsigned me){
+        uint64_t seen=0;
+        std::unique_lock<std::mutex> l(mu);
+        for(;;){
+            wake.wait(l,[&]{return stopping||epoch!=seen;});
+            if(stopping)return;
+            seen=epoch;
+            auto s=src; auto d=dst; auto n=words;
+            l.unlock();
+            piece(me,participants,n,d,s);
+            l.lock();
+            if(--pending==0)done.notify_one();
+        }
+    }
+    void shutdown(){
+        {std::lock_guard<std::mutex> l(mu);stopping=true;}
+        wake.notify_all();
+        for(auto& w:workers)if(w.joinable())w.join();
+    }
+public:
+    explicit Team(unsigned count=concurrency()):participants(std::max(1u,count)){
+        try{
+            workers.reserve(participants-1);
+            for(unsigned id=1;id<participants;++id)
+                workers.emplace_back([this,id]{loop(id);});
+        }catch(...){shutdown();throw;}
+    }
+    ~Team(){shutdown();}
+    Team(const Team&)=delete;
+    Team& operator=(const Team&)=delete;
+    void copy(uint32_t* d,const uint32_t* s,size_t n){
+        if(!n)return;
+        if(participants==1||n<(1u<<16)){
+            std::memcpy(d,s,n*sizeof(uint32_t)); return;
+        }
+        {
+            std::lock_guard<std::mutex> l(mu);
+            dst=d;src=s;words=n;pending=participants-1;++epoch;
+        }
+        wake.notify_all();
+        piece(0,participants,n,d,s);
+        std::unique_lock<std::mutex> l(mu);
+        done.wait(l,[&]{return pending==0;});
+        dst=nullptr;src=nullptr;
+    }
+};
+constexpr unsigned max_chunks=4;
+inline unsigned chunks(size_t n){
+    // At most four handoffs per direction (per operand for input).
+    constexpr size_t target_words=(2u<<20)/sizeof(uint32_t);
+    return unsigned(std::max<size_t>(1,std::min<size_t>(max_chunks,(n+target_words-1)/target_words)));
+}
+inline size_t offset(size_t n,unsigned i,unsigned count){
+    return i==count?n:(n/16*i/count)*16;
+}
+} // namespace ari_copy
+
 namespace {
 void check(cudaError_t e,const char* where) {
     if(e!=cudaSuccess) throw std::runtime_error(std::string(where)+": "+cudaGetErrorString(e));
@@ -813,8 +919,16 @@ __global__ void decode(uint32_t* a,const ari::Prime* primes,const uint32_t* untw
     const size_t at=size_t(k)*N+i;const auto p=primes[k];
     a[at]=ari::mont(ari::mont(a[at],untwist[at],p),1,p);
 }
+struct Event {
+    cudaEvent_t e=nullptr;
+    Event(){check(cudaEventCreateWithFlags(&e,cudaEventDisableTiming),"create D2H event");}
+    Event(const Event&)=delete;
+    ~Event(){if(e)cudaEventDestroy(e);}
+};
 struct State {
     ari::Plan plan;
+    ari_copy::Team copy_team;
+    Event ready[ari_copy::max_chunks];
     Buffer<uint32_t> a,b,c,ra,rb,rc,roots,inverse_roots,twist,untwist;
     Buffer<ari::Prime> primes;
     Buffer<ari_shoup::Weight> weights;
@@ -857,12 +971,17 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     if(in.a.data.size()!=words||in.b.data.size()!=words)throw std::runtime_error("input size does not match point");
     RunFence fence;
 #if FHERMA_PINNED_INPUT
-    std::memcpy(s.host_a.ptr,in.a.data.data(),bytes);
-    check(cudaMemcpyAsync(s.a.ptr,s.host_a.ptr,bytes,cudaMemcpyHostToDevice,nullptr),"upload staged a");
-    // This host copy can overlap the preceding A DMA. B is not enqueued
-    // until its staging copy has finished; all GPU work stays in stream zero.
-    std::memcpy(s.host_b.ptr,in.b.data.data(),bytes);
-    check(cudaMemcpyAsync(s.b.ptr,s.host_b.ptr,bytes,cudaMemcpyHostToDevice,nullptr),"upload staged b");
+    const unsigned in_chunks=ari_copy::chunks(words);
+    auto upload=[&](uint32_t* device,uint32_t* stage,const uint32_t* source){
+        for(unsigned i=0;i<in_chunks;++i){
+            size_t lo=ari_copy::offset(words,i,in_chunks),hi=ari_copy::offset(words,i+1,in_chunks);
+            s.copy_team.copy(stage+lo,source+lo,hi-lo);
+            check(cudaMemcpyAsync(device+lo,stage+lo,(hi-lo)*sizeof(uint32_t),
+                                  cudaMemcpyHostToDevice,nullptr),"upload staged chunk");
+        }
+    };
+    upload(s.a.ptr,s.host_a.ptr,in.a.data.data());
+    upload(s.b.ptr,s.host_b.ptr,in.b.data.data());
 #else
     check(cudaMemcpy(s.a.ptr,in.a.data.data(),bytes,cudaMemcpyHostToDevice),"upload a");
     check(cudaMemcpy(s.b.ptr,in.b.data.data(),bytes,cudaMemcpyHostToDevice),"upload b");
@@ -896,14 +1015,22 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     check(s.crt->run(s.rc.ptr,s.c.ptr),"CRT launch");
     fherma::Outputs out;out.c.shape={int64_t(p.N),int64_t(p.L)};
 #if FHERMA_PINNED_OUTPUT
-    // Allocate the returned vector's storage while preceding GPU kernels run,
-    // but do not create/zero its elements before the result arrives.
-    check(cudaMemcpyAsync(s.host_c.ptr,s.c.ptr,bytes,cudaMemcpyDeviceToHost,nullptr),"download staged result");
-    out.c.data.reserve(words);
+    const unsigned out_chunks=ari_copy::chunks(words);
+    for(unsigned i=0;i<out_chunks;++i){
+        size_t lo=ari_copy::offset(words,i,out_chunks),hi=ari_copy::offset(words,i+1,out_chunks);
+        check(cudaMemcpyAsync(s.host_c.ptr+lo,s.c.ptr+lo,(hi-lo)*sizeof(uint32_t),
+                              cudaMemcpyDeviceToHost,nullptr),"download staged chunk");
+        check(cudaEventRecord(s.ready[i].e,nullptr),"mark D2H chunk");
+    }
+    // Create vector elements normally; zero-fill and page faults can overlap
+    // already enqueued GPU work. No worker writes uninitialized vector storage.
+    out.c.data.resize(words);
+    for(unsigned i=0;i<out_chunks;++i){
+        size_t lo=ari_copy::offset(words,i,out_chunks),hi=ari_copy::offset(words,i+1,out_chunks);
+        check(cudaEventSynchronize(s.ready[i].e),"wait for D2H chunk");
+        s.copy_team.copy(out.c.data.data()+lo,s.host_c.ptr+lo,hi-lo);
+    }
     fence.complete();
-    // Range initialization writes final values directly instead of first
-    // zero-filling a vector. It still allocates and copies inside the clock.
-    out.c.data.assign(s.host_c.ptr,s.host_c.ptr+words);
 #else
     out.c.data.resize(words);
     check(cudaMemcpy(out.c.data.data(),s.c.ptr,bytes,cudaMemcpyDeviceToHost),"download result");
