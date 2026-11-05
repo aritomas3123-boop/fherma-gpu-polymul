@@ -520,21 +520,21 @@ FHD inline Pair high_pair(unsigned h,unsigned half_high,unsigned low,unsigned n)
         (within * max_tile + low) * (n / (2 * half_high * max_tile))};
 }
 #ifndef FHERMA_TILE_COORDS_ONLY
-template<bool Two>
+template<bool Two, unsigned RootStep = 1>
 __global__ void low_stages(uint32_t *a, uint32_t *b, const ari::Prime *primes,
                            const uint32_t *roots, unsigned n, unsigned tile) {
     extern __shared__ uint32_t data[];
     uint32_t *sa = data, *sb = data + tile;
     const unsigned t = threadIdx.x;
     const std::size_t base = std::size_t(blockIdx.y) * n + blockIdx.x * tile;
-    const uint32_t *table = roots + std::size_t(blockIdx.y) * (n / 2);
+    const uint32_t *table = roots + std::size_t(blockIdx.y) * (n / 2) * RootStep;
     const ari::Prime p = primes[blockIdx.y];
     sa[t] = a[base + t]; sa[t + blockDim.x] = a[base + t + blockDim.x];
     if constexpr (Two) { sb[t] = b[base + t]; sb[t + blockDim.x] = b[base + t + blockDim.x]; }
     __syncthreads();
     for (unsigned half = 1; half < tile; half *= 2) {
         Pair pair = low_pair(t, half, n);
-        uint32_t w = table[pair.root];
+        uint32_t w = table[RootStep * pair.root];
         ari::butterfly(sa[pair.first], sa[pair.second], w, p);
         if constexpr (Two) ari::butterfly(sb[pair.first], sb[pair.second], w, p);
         __syncthreads();
@@ -542,7 +542,7 @@ __global__ void low_stages(uint32_t *a, uint32_t *b, const ari::Prime *primes,
     a[base + t] = sa[t]; a[base + t + blockDim.x] = sa[t + blockDim.x];
     if constexpr (Two) { b[base + t] = sb[t]; b[base + t + blockDim.x] = sb[t + blockDim.x]; }
 }
-template<bool Two>
+template<bool Two, unsigned RootStep = 1>
 __global__ void high_stages(uint32_t *a, uint32_t *b, const ari::Prime *primes,
                             const uint32_t *roots, unsigned n) {
     // If index = h * 512 + low, all stages with half >= 512 keep "low"
@@ -553,7 +553,7 @@ __global__ void high_stages(uint32_t *a, uint32_t *b, const ari::Prime *primes,
     const unsigned lane = threadIdx.x, row_worker = threadIdx.y;
     const unsigned low = blockIdx.x * low_columns + lane;
     const std::size_t plane = std::size_t(blockIdx.y) * n;
-    const uint32_t *table = roots + std::size_t(blockIdx.y) * (n / 2);
+    const uint32_t *table = roots + std::size_t(blockIdx.y) * (n / 2) * RootStep;
     const ari::Prime p = primes[blockIdx.y];
     for (unsigned h = row_worker; h < high_count; h += high_workers) {
         unsigned local = h * low_columns + lane;
@@ -567,7 +567,7 @@ __global__ void high_stages(uint32_t *a, uint32_t *b, const ari::Prime *primes,
             Pair pair = high_pair(h, half_high, low, n);
             unsigned first = pair.first * low_columns + lane;
             unsigned second = pair.second * low_columns + lane;
-            uint32_t w = table[pair.root];
+            uint32_t w = table[RootStep * pair.root];
             ari::butterfly(sa[first], sa[second], w, p);
             if constexpr (Two) ari::butterfly(sb[first], sb[second], w, p);
         }
@@ -580,18 +580,18 @@ __global__ void high_stages(uint32_t *a, uint32_t *b, const ari::Prime *primes,
         if constexpr (Two) b[global] = sb[local];
     }
 }
-template<bool Two>
+template<bool Two, unsigned RootStep = 1>
 inline cudaError_t transform(uint32_t *a, uint32_t *b, const ari::Prime *primes,
                              const uint32_t *roots, unsigned n, unsigned k,
                              cudaStream_t stream = nullptr) {
     if (n < 2 || n > 65536 || (n & (n - 1))) return cudaErrorInvalidValue;
     unsigned tile = n < max_tile ? n : max_tile;
     constexpr unsigned arrays = Two ? 2 : 1;
-    low_stages<Two><<<dim3(n / tile, k), tile / 2, arrays * tile * sizeof(uint32_t), stream>>>
+    low_stages<Two,RootStep><<<dim3(n / tile, k), tile / 2, arrays * tile * sizeof(uint32_t), stream>>>
         (a, b, primes, roots, n, tile);
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess || n == tile) return status;
-    high_stages<Two><<<dim3(max_tile / low_columns, k),
+    high_stages<Two,RootStep><<<dim3(max_tile / low_columns, k),
         dim3(low_columns,high_workers), arrays * (n / tile) * low_columns * sizeof(uint32_t),stream>>>
         (a, b, primes, roots, n);
     return cudaGetLastError();
@@ -829,7 +829,7 @@ using EncB=wmma::fragment<wmma::matrix_b,16,16,16,unsigned char,wmma::col_major>
 // Reorder coefficients by the NTT's initial bit permutation while packing;
 // the input remains unmodified. Padding is rewritten each run, not assumed.
 __global__ void pack_operand(const std::uint32_t* __restrict__ input,
-    std::uint8_t* __restrict__ dst,unsigned n,unsigned l,unsigned bits,unsigned operand) {
+    std::uint8_t* __restrict__ dst,unsigned n,unsigned l,unsigned bits,unsigned panel_start,unsigned panel_rows) {
     constexpr unsigned rows_per_cta=8;
     const unsigned row=blockIdx.x*rows_per_cta+threadIdx.x/16;
     const unsigned limb=blockIdx.y*16+threadIdx.x%16;
@@ -840,10 +840,10 @@ __global__ void pack_operand(const std::uint32_t* __restrict__ input,
         const unsigned original=__brev(row)>>(32-bits);
         v=input[std::size_t(original)*l+limb];
     }
-    const unsigned out_row=operand*np+row;
+    const unsigned out_row=panel_start+row;
     #pragma unroll
     for(unsigned d=0;d<4;++d)
-        dst[word_offset(d,out_row,limb,2*np,lp)]=std::uint8_t(v>>(8*d));
+        dst[word_offset(d,out_row,limb,panel_rows,lp)]=std::uint8_t(v>>(8*d));
 }
 
 // Each warp produces 16 (already bit-reversed) coefficients x 16 primes.
@@ -852,12 +852,13 @@ __global__ void pack_operand(const std::uint32_t* __restrict__ input,
 __global__ void encode_gemm(const std::uint8_t* __restrict__ a,
     const std::uint8_t* __restrict__ weights,std::uint32_t* __restrict__ out,
     const ari::Prime* __restrict__ primes,const ari_shoup::Weight* __restrict__ radix,
-    const std::uint32_t* __restrict__ twist,unsigned n,unsigned l,unsigned count,unsigned operand) {
+    const std::uint32_t* __restrict__ twist,unsigned n,unsigned l,unsigned count,
+    unsigned panel_start,unsigned panel_rows,unsigned twist_pitch) {
     constexpr unsigned warps=4;
     const unsigned lane=threadIdx.x%32,warp=threadIdx.x/32;
     const unsigned r0=blockIdx.x*16,k0=(blockIdx.y*warps+warp)*16;
     if(k0>=count)return;  // uniform within warp, no CTA-wide barriers
-    const unsigned np=round16(n),kp=round16(count),lp=round16(l);
+    const unsigned kp=round16(count),lp=round16(l);
     EncAcc diag[7];
     #pragma unroll
     for(unsigned d=0;d<7;++d)wmma::fill_fragment(diag[d],0);
@@ -865,7 +866,7 @@ __global__ void encode_gemm(const std::uint8_t* __restrict__ a,
         EncA af[4];EncB bf[4];
         #pragma unroll
         for(unsigned d=0;d<4;++d) {
-            wmma::load_matrix_sync(af[d],a+word_offset(d,operand*np+r0,j,2*np,lp),16);
+            wmma::load_matrix_sync(af[d],a+word_offset(d,panel_start+r0,j,panel_rows,lp),16);
             wmma::load_matrix_sync(bf[d],weights+word_offset(d,k0,j,kp,lp),16);
         }
         #pragma unroll
@@ -897,7 +898,7 @@ __global__ void encode_gemm(const std::uint8_t* __restrict__ a,
                 std::uint32_t(words[warp][1][elem]),std::uint32_t(words[warp][2][elem]),
                 p,radix+2*k);
             const std::size_t at=std::size_t(k)*n+r;
-            out[at]=twist_residue(xR,twist[at],p);
+            out[at]=twist_residue(xR,twist[std::size_t(k)*twist_pitch+r],p);
         }
     }
 }
@@ -907,15 +908,23 @@ inline cudaError_t launch_operand(const std::uint32_t *input,std::uint32_t *resi
     unsigned operand,std::uint8_t *packed_inputs,
     const std::uint8_t *packed_weights,const ari::Prime *primes,
     const ari_shoup::Weight *radix_shoup,const std::uint32_t *twist_reversed,
-    unsigned n,unsigned limbs,unsigned log_n,unsigned count,cudaStream_t stream=nullptr) {
+    unsigned n,unsigned limbs,unsigned log_n,unsigned count,cudaStream_t stream=nullptr,
+    unsigned parent_n=0) {
     if(n<2||n>65536||(n&(n-1))||!limbs||limbs>55||!count||
        log_n>16||(1u<<log_n)!=n||operand>1)return cudaErrorInvalidValue;
-    // Each branch reads/writes only its own N padded rows in every panel.
+    // For split B, bitrev_N(parity*N/2 + r) = 2*bitrev_(N/2)(r) + parity.
+    // Both B branches share the old B capacity; each still owns disjoint rows.
+    const unsigned np=round16(n);
+    const unsigned panel_rows=2*round16(parent_n ? parent_n : n);
+    const unsigned panel_start=(parent_n ? round16(parent_n) : 0)+operand*np;
+    if (parent_n && (parent_n!=2*n || n<16)) return cudaErrorInvalidValue;
+    const unsigned twist_pitch=parent_n ? parent_n : n;
     pack_operand<<<dim3(round16(n)/8,round16(limbs)/16),128,0,stream>>>
-        (input,packed_inputs,n,limbs,log_n,operand);
+        (input,packed_inputs,n,limbs,log_n,panel_start,panel_rows);
     auto status=cudaGetLastError();if(status!=cudaSuccess)return status;
     encode_gemm<<<dim3(round16(n)/16,(count+63)/64),128,0,stream>>>
-       (packed_inputs,packed_weights,residues,primes,radix_shoup,twist_reversed,n,limbs,count,operand);
+       (packed_inputs,packed_weights,residues,primes,radix_shoup,twist_reversed,n,limbs,count,
+        panel_start,panel_rows,twist_pitch);
     return cudaGetLastError();
 }
 } // namespace ari_wmma_encoder
@@ -971,6 +980,7 @@ class Team {
     uint32_t* dst=nullptr;
     size_t words=0;
     bool wc_job=false;
+    unsigned parity_limbs=0;
     static void publish_wc(bool enabled){
         if(!enabled)return;
 #if defined(__x86_64__) || defined(__i386__)
@@ -979,7 +989,17 @@ class Team {
         std::atomic_thread_fence(std::memory_order_seq_cst);
 #endif
     }
-    static void piece(unsigned me,unsigned count,size_t n,uint32_t* d,const uint32_t* s){
+    static void piece(unsigned me,unsigned count,size_t n,uint32_t* d,const uint32_t* s,
+                      unsigned limbs){
+        if (limbs) {
+            const size_t pairs=n/(2*limbs);
+            const size_t lo=pairs*me/count, hi=pairs*(me+1)/count;
+            for (size_t j=lo;j<hi;++j) {
+                std::memcpy(d+j*limbs,s+(2*j)*limbs,limbs*sizeof(uint32_t));
+                std::memcpy(d+(pairs+j)*limbs,s+(2*j+1)*limbs,limbs*sizeof(uint32_t));
+            }
+            return;
+        }
         // Partition cache lines; only the last worker handles the tail.
         const size_t lines=n/16;
         const size_t lo=16*(lines*me/count);
@@ -993,9 +1013,9 @@ class Team {
             wake.wait(l,[&]{return stopping||epoch!=seen;});
             if(stopping)return;
             seen=epoch;
-            auto s=src; auto d=dst; auto n=words;auto wc=wc_job;
+            auto s=src; auto d=dst; auto n=words;auto wc=wc_job;auto limbs=parity_limbs;
             l.unlock();
-            piece(me,participants,n,d,s);
+            piece(me,participants,n,d,s,limbs);
             publish_wc(wc);
             l.lock();
             if(--pending==0)done.notify_one();
@@ -1017,17 +1037,17 @@ public:
     ~Team(){shutdown();}
     Team(const Team&)=delete;
     Team& operator=(const Team&)=delete;
-    void copy(uint32_t* d,const uint32_t* s,size_t n,bool wc=false){
+    void copy(uint32_t* d,const uint32_t* s,size_t n,bool wc=false,unsigned limbs=0){
         if(!n)return;
         if(participants==1||n<(1u<<16)){
-            std::memcpy(d,s,n*sizeof(uint32_t)); publish_wc(wc); return;
+            piece(0,1,n,d,s,limbs); publish_wc(wc); return;
         }
         {
             std::lock_guard<std::mutex> l(mu);
-            dst=d;src=s;words=n;wc_job=wc;pending=participants-1;++epoch;
+            dst=d;src=s;words=n;wc_job=wc;parity_limbs=limbs;pending=participants-1;++epoch;
         }
         wake.notify_all();
-        piece(0,participants,n,d,s);
+        piece(0,participants,n,d,s,limbs);
         publish_wc(wc);
         std::unique_lock<std::mutex> l(mu);
         done.wait(l,[&]{return pending==0;});
@@ -1067,7 +1087,7 @@ template<class T> struct HostBuffer {
 struct OperandStream {
     cudaStream_t handle=nullptr;
     OperandStream(){
-        check(cudaStreamCreateWithFlags(&handle,cudaStreamNonBlocking),"create A stream");
+        check(cudaStreamCreateWithFlags(&handle,cudaStreamNonBlocking),"create operand stream");
     }
     OperandStream(const OperandStream&)=delete;
     ~OperandStream(){if(handle)cudaStreamDestroy(handle);}
@@ -1084,12 +1104,13 @@ struct ForwardReady {
 // that join, a partial failure may have submitted work on either stream.
 struct RunFence {
     bool completed=false;
-    cudaStream_t operand_a;
-    explicit RunFence(cudaStream_t a):operand_a(a){}
+    cudaStream_t operand_a,even_b;
+    explicit RunFence(cudaStream_t a,cudaStream_t b=nullptr):operand_a(a),even_b(b){}
     RunFence(const RunFence&)=delete;
     ~RunFence(){
         if(!completed){
             cudaStreamSynchronize(operand_a);
+            if(even_b) cudaStreamSynchronize(even_b);
             cudaStreamSynchronize(nullptr);
         }
     }
@@ -1099,6 +1120,28 @@ struct RunFence {
         completed=true;
     }
 };
+// Fuse the last radix-2 B butterfly with product and the inverse's initial
+// bit reversal. E/O halves are each in [prime][natural-frequency] order.
+FHD inline void split_products(uint32_t even, uint32_t odd, uint32_t root,
+                               uint32_t a_low, uint32_t a_high, const ari::Prime& prime,
+                               uint32_t& low, uint32_t& high) {
+    ari::butterfly(even,odd,root,prime);
+    low=ari::mont(a_low,even,prime);
+    high=ari::mont(a_high,odd,prime);
+}
+__global__ void split_multiply_reverse(const uint32_t* a,const uint32_t* branches,
+                                      uint32_t* c,const uint32_t* roots,
+                                      const ari::Prime* primes,unsigned n,unsigned bits,unsigned count) {
+    const unsigned i=blockIdx.x*blockDim.x+threadIdx.x, k=blockIdx.y, half=n/2;
+    if(i>=half) return;
+    const size_t branch=size_t(k)*half+i, plane=size_t(k)*n;
+    uint32_t lo,hi;
+    split_products(branches[branch],branches[size_t(count)*half+branch],roots[branch],
+                   a[plane+i],a[plane+half+i],primes[k],lo,hi);
+    const size_t dst=plane+ari::reverse_bits(i,bits);
+    c[dst]=lo;
+    c[dst+1]=hi; // reversing i+N/2 sets exactly the low bit
+}
 __global__ void multiply_reverse(const uint32_t* a,const uint32_t* b,uint32_t* c,
                                  const ari::Prime* primes,unsigned N,unsigned logN) {
     const unsigned i=blockIdx.x*blockDim.x+threadIdx.x,k=blockIdx.y;if(i>=N)return;
@@ -1121,8 +1164,8 @@ __global__ void decode(uint32_t* a,const ari::Prime* primes,const uint32_t* untw
 }
 struct State {
     ari::Plan plan;
-    OperandStream stream_a;
-    ForwardReady forward_a;
+    OperandStream stream_a,stream_even_b;
+    ForwardReady forward_a,forward_even_b;
     Buffer<uint32_t> a,b,c,ra,rb,rc,roots,inverse_roots,twist,untwist;
     Buffer<ari::Prime> primes;
     Buffer<uint8_t> packed_inputs, packed_weights;
@@ -1238,7 +1281,8 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     auto& s=*static_cast<State*>(state);const auto& p=s.plan;
     const size_t words=size_t(p.N)*p.L,bytes=words*sizeof(uint32_t);
     if(in.a.data.size()!=words||in.b.data.size()!=words)throw std::runtime_error("input size does not match point");
-    RunFence fence(s.stream_a.handle);
+    const bool split_b=FHERMA_NTT_TILED && p.N>=32;
+    RunFence fence(s.stream_a.handle,split_b?s.stream_even_b.handle:nullptr);
     const dim3 grid((p.N+255)/256,p.K);
 #if !FHERMA_NTT_TILED
     const dim3 butterflies((p.N/2+255)/256,p.K);
@@ -1268,10 +1312,37 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     };
     submit_operand(0,in.a.data.data(),s.stream_a.handle);
     check(cudaEventRecord(s.forward_a.handle,s.stream_a.handle),"mark A transform complete");
-    // This CPU staging copy and the B upload may overlap A's encoder/NTT.
-    submit_operand(1,in.b.data.data(),nullptr);
-    check(cudaStreamWaitEvent(nullptr,s.forward_a.handle,0),"join A and B before product");
-    multiply_reverse<<<grid,256>>>(s.ra.ptr,s.rb.ptr,s.rc.ptr,s.primes.ptr,p.N,p.logN);
+    if (split_b) {
+        const unsigned half=p.N/2;
+        const size_t half_words=size_t(half)*p.L;
+        const size_t half_residues=size_t(half)*p.K;
+        s.copy_team->copy(s.host_b.ptr,in.b.data.data(),words,s.input_wc,p.L);
+        auto submit_half=[&](unsigned parity,cudaStream_t stream) {
+            uint32_t* device=s.b.ptr+parity*half_words;
+            uint32_t* residues=s.rb.ptr+parity*half_residues;
+            check(cudaMemcpyAsync(device,s.host_b.ptr+parity*half_words,half_words*sizeof(uint32_t),
+                                  cudaMemcpyHostToDevice,stream),"upload parity panel");
+            // Keep the original parent twist. Across primes its pitch is N;
+            // the parity offset within that bit-reversed table is parity*N/2.
+            check(ari_wmma_encoder::launch_operand(device,residues,parity,s.packed_inputs.ptr,
+                        s.packed_weights.ptr,s.primes.ptr,s.radix.ptr,s.twist.ptr+parity*half,
+                        half,p.L,p.logN-1,p.K,stream,p.N),"encode parity panel");
+            check(ari_tile::transform<false,2>(residues,nullptr,s.primes.ptr,s.roots.ptr,
+                                               half,p.K,stream),"forward parity NTT");
+        };
+        submit_half(0,s.stream_even_b.handle);
+        check(cudaEventRecord(s.forward_even_b.handle,s.stream_even_b.handle),"mark even B ready");
+        submit_half(1,nullptr);
+        check(cudaStreamWaitEvent(nullptr,s.forward_even_b.handle,0),"join even and odd B");
+        check(cudaStreamWaitEvent(nullptr,s.forward_a.handle,0),"join A before split product");
+        split_multiply_reverse<<<dim3((half+255)/256,p.K),256>>>(s.ra.ptr,s.rb.ptr,s.rc.ptr,
+                                      s.roots.ptr,s.primes.ptr,p.N,p.logN,p.K);
+    } else {
+        // Preserve the existing small-N/padding and untiled fallback.
+        submit_operand(1,in.b.data.data(),nullptr);
+        check(cudaStreamWaitEvent(nullptr,s.forward_a.handle,0),"join A and B before product");
+        multiply_reverse<<<grid,256>>>(s.ra.ptr,s.rb.ptr,s.rc.ptr,s.primes.ptr,p.N,p.logN);
+    }
     check(cudaGetLastError(),"multiply launch");
 #if FHERMA_NTT_TILED
     check(ari_tile::transform<false>(s.rc.ptr,nullptr,s.primes.ptr,s.inverse_roots.ptr,p.N,p.K),"tiled inverse NTT");
