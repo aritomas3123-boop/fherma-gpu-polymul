@@ -1158,6 +1158,109 @@ public:
 };
 } // namespace ari_staggered
 
+// Include at GLOBAL scope after cuda_runtime.h. Diagnostics only, no counters.
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <stdexcept>
+#include <string>
+#include <vector>
+#ifndef FHERMA_OVERLAP_DIAGNOSTIC
+#define FHERMA_OVERLAP_DIAGNOSTIC 1
+#endif
+#if FHERMA_OVERLAP_DIAGNOSTIC
+namespace ari_overlap {
+using Clock=std::chrono::steady_clock;
+inline double ms(Clock::duration d){return std::chrono::duration<double,std::milli>(d).count();}
+enum Cpu : unsigned {RegisterA,RegisterB,ResizeC,RegisterC,InputEventWait,
+    UnregisterInputs,FinalWait,UnregisterC,BeforeCapture,CpuCount};
+constexpr unsigned event_count=25,gpu_count=17,capacity=128;
+constexpr unsigned input_begin(unsigned operand){return 1+operand*6;}
+constexpr unsigned crt_begin(unsigned part){return 15+part*2;}
+constexpr unsigned output_begin=23,output_end=24;
+struct Sample {
+    std::array<double,CpuCount> cpu{};
+    std::array<double,gpu_count> gpu{};
+    unsigned parts=0;
+    int crt_ready_after_register=-1;
+};
+class Profile {
+    std::array<cudaEvent_t,event_count> event_{};
+    std::vector<Sample> calls_;
+    static void checked(cudaError_t status,const char* where){
+        if(status!=cudaSuccess)throw std::runtime_error(std::string(where)+": "+cudaGetErrorString(status));
+    }
+    void release() noexcept {for(auto e:event_)if(e)cudaEventDestroy(e);}
+    double elapsed(unsigned first,unsigned last) const {
+        float value=0;checked(cudaEventElapsedTime(&value,event_[first],event_[last]),"read diagnostic GPU interval");
+        return value;
+    }
+public:
+    Profile(){
+        calls_.reserve(capacity);
+        try {for(auto& e:event_)checked(cudaEventCreate(&e),"create diagnostic timing event");}
+        catch(...){release();throw;}
+    }
+    ~Profile(){release();}
+    Profile(const Profile&)=delete;
+    void mark(unsigned index,cudaStream_t stream){
+        checked(cudaEventRecord(event_[index],stream),"record diagnostic GPU event");
+    }
+    int query(unsigned index){
+        const auto status=cudaEventQuery(event_[index]);
+        if(status==cudaErrorNotReady)return 0;
+        checked(status,"query diagnostic CRT ready");return 1;
+    }
+    // Caller has already completed ALL streams using the original RunFence.
+    // No event synchronize, stream synchronize or device synchronize is added.
+    void capture(Sample sample){
+        if(calls_.size()==calls_.capacity())return;
+        sample.gpu.fill(-1.0);unsigned col=0;
+        for(unsigned operand=0;operand<2;++operand){
+            const auto e=input_begin(operand);
+            for(unsigned phase=0;phase<3;++phase)sample.gpu[col++]=elapsed(e+phase*2,e+phase*2+1);
+        }
+        sample.gpu[col++]=elapsed(13,14);
+        for(unsigned part=0;part<4;++part)
+            sample.gpu[col++]=part<sample.parts?elapsed(crt_begin(part),crt_begin(part)+1):-1.0;
+        sample.gpu[col++]=elapsed(output_begin,output_end);
+        for(unsigned e: {6u,12u,14u,crt_begin(sample.parts-1)+1,output_end})
+            sample.gpu[col++]=elapsed(0,e);
+        calls_.push_back(sample);
+    }
+    void report(unsigned n,unsigned w) const {
+        if(calls_.empty())return;
+        std::array<double,capacity> values{};
+        auto print=[&](const char* name,auto get){
+            unsigned used=0;
+            for(const auto& row:calls_){const double v=get(row);if(v>=0 && std::isfinite(v))values[used++]=v;}
+            if(!used){std::fprintf(stderr," %s=NA",name);return;}
+            std::sort(values.begin(),values.begin()+used);
+            std::fprintf(stderr," %s=%.6f",name,(values[(used-1)/2]+values[used/2])*0.5);
+        };
+        const char* cpu_names[]={"register_A","register_B","resize_C","register_C",
+            "input_events_wait","unregister_inputs","final_wait","unregister_C","before_capture"};
+        const char* gpu_names[]={"A_H2D_span","A_encode_span","A_forward_span",
+            "B_H2D_span","B_encode_span","B_forward_span","multiply_inverse_span",
+            "CRT0_span","CRT1_span","CRT2_span","CRT3_span","D2H_span",
+            "A_forward_from_origin","B_forward_from_origin","inverse_from_origin",
+            "last_CRT_from_origin","D2H_done_from_origin"};
+        std::fprintf(stderr,"ARI_OVERLAP_CPU N=%u W=%u calls=%zu median_ms",n,w,calls_.size());
+        for(unsigned col=0;col<CpuCount;++col)print(cpu_names[col],[col](const Sample& row){return row.cpu[col];});
+        std::fprintf(stderr,"\nARI_OVERLAP_GPU N=%u W=%u calls=%zu median_ms",n,w,calls_.size());
+        for(unsigned col=0;col<gpu_count;++col)print(gpu_names[col],[col](const Sample& row){return row.gpu[col];});
+        unsigned ready=0,pending=0;
+        for(const auto& row:calls_){ready+=row.crt_ready_after_register==1;pending+=row.crt_ready_after_register==0;}
+        std::fprintf(stderr,"\nARI_OVERLAP_QUERY N=%u W=%u last_CRT_ready_after_register_C=%u pending=%u "
+            "warmups_included=1 diagnostic_only=1 do_not_sum_stage_medians=1\n",n,w,ready,pending);
+        std::fflush(stderr);
+    }
+};
+} // namespace ari_overlap
+#endif
+
 namespace {
 void check(cudaError_t e,const char* where) {
     if(e!=cudaSuccess) throw std::runtime_error(std::string(where)+": "+cudaGetErrorString(e));
@@ -1251,6 +1354,9 @@ void report_host_access_capabilities(){
 }
 struct State {
     ari::Plan plan;
+#if FHERMA_OVERLAP_DIAGNOSTIC
+    ari_overlap::Profile diag;
+#endif
     AsyncStream stream_a,download;
     ReadyEvent forward_a,uploaded[2],produced[max_parts];
     const ari_staggered::Address page_size=ari_staggered::host_page_size();
@@ -1288,6 +1394,10 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     auto& s=*static_cast<State*>(state);const auto& p=s.plan;
     const size_t words=size_t(p.N)*p.L,bytes=words*sizeof(uint32_t);
     if(in.a.data.size()!=words||in.b.data.size()!=words)throw std::runtime_error("input size does not match point");
+#if FHERMA_OVERLAP_DIAGNOSTIC
+    ari_overlap::Sample sample;
+    const auto run_started=ari_overlap::Clock::now();
+#endif
     // Reverse lifetime order on exceptions: drain streams, unregister all
     // ranges, then free the caller-owned result's ordinary vector storage.
     fherma::Outputs out;out.c.shape={int64_t(p.N),int64_t(p.L)};
@@ -1295,6 +1405,10 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     const unsigned parts=result_parts(bytes);
     cudaStream_t download=parts>1?s.download.handle:nullptr;
     RunFence fence(s.stream_a.handle,download);
+#if FHERMA_OVERLAP_DIAGNOSTIC
+    sample.parts=parts;
+    s.diag.mark(0,nullptr);
+#endif
     const dim3 grid((p.N+255)/256,p.K);
 #if !FHERMA_NTT_TILED
     const dim3 butterflies((p.N/2+255)/256,p.K);
@@ -1302,16 +1416,34 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     auto submit_operand=[&](unsigned operand,const uint32_t* input,cudaStream_t stream){
         uint32_t* device=operand?s.b.ptr:s.a.ptr;
         uint32_t* residues=operand?s.rb.ptr:s.ra.ptr;
+#if FHERMA_OVERLAP_DIAGNOSTIC
+        const auto register_started=ari_overlap::Clock::now();
+#endif
         registered.acquire(input,bytes);
+#if FHERMA_OVERLAP_DIAGNOSTIC
+        sample.cpu[operand?ari_overlap::RegisterB:ari_overlap::RegisterA]=ari_overlap::ms(ari_overlap::Clock::now()-register_started);
+        const unsigned operand_mark=ari_overlap::input_begin(operand);
+        s.diag.mark(operand_mark,stream);
+#endif
         registered.for_chunks(input,bytes,[&](size_t offset,size_t amount){
             auto* dst=reinterpret_cast<unsigned char*>(device)+offset;
             const auto* src=reinterpret_cast<const unsigned char*>(input)+offset;
             check(cudaMemcpyAsync(dst,src,amount,cudaMemcpyHostToDevice,stream),"upload registered input");
         });
+#if FHERMA_OVERLAP_DIAGNOSTIC
+        s.diag.mark(operand_mark+1,stream);
+#endif
         check(cudaEventRecord(s.uploaded[operand].handle,stream),"mark last H2D read");
+#if FHERMA_OVERLAP_DIAGNOSTIC
+        s.diag.mark(operand_mark+2,stream);
+#endif
         check(ari_wmma_encoder::launch_operand(device,residues,operand,s.packed_inputs.ptr,
             s.packed_weights.ptr,s.primes.ptr,s.radix.ptr,s.twist.ptr,
             p.N,p.L,p.logN,p.K,stream),"encode operand");
+#if FHERMA_OVERLAP_DIAGNOSTIC
+        s.diag.mark(operand_mark+3,stream);
+        s.diag.mark(operand_mark+4,stream);
+#endif
 #if FHERMA_NTT_TILED
         // The template selects the number of arrays. The roots select direction.
         check(ari_tile::transform<false>(residues,nullptr,s.primes.ptr,s.roots.ptr,
@@ -1322,12 +1454,18 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
             check(cudaGetLastError(),"single-operand forward stage");
         }
 #endif
+#if FHERMA_OVERLAP_DIAGNOSTIC
+        s.diag.mark(operand_mark+5,stream);
+#endif
     };
     submit_operand(0,in.a.data.data(),s.stream_a.handle);
     check(cudaEventRecord(s.forward_a.handle,s.stream_a.handle),"mark A transform complete");
     // Register B only after the entire A branch has been submitted.
     submit_operand(1,in.b.data.data(),nullptr);
     check(cudaStreamWaitEvent(nullptr,s.forward_a.handle,0),"join A and B before product");
+#if FHERMA_OVERLAP_DIAGNOSTIC
+    s.diag.mark(13,nullptr);
+#endif
     multiply_reverse<<<grid,256>>>(s.ra.ptr,s.rb.ptr,s.rc.ptr,s.primes.ptr,p.N,p.logN);
     check(cudaGetLastError(),"multiply launch");
 #if FHERMA_NTT_TILED
@@ -1338,34 +1476,84 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
         check(cudaGetLastError(),"inverse NTT launch");
     }
 #endif
+#if FHERMA_OVERLAP_DIAGNOSTIC
+    s.diag.mark(14,nullptr);
+#endif
     // Queue every producer first, so constructing/registering C does not
     // delay any CRT stripe. Each writes its own coefficient span in device C.
     for(unsigned part=0;part<parts;++part){
         const unsigned first=part_boundary(p.N,part,parts),last=part_boundary(p.N,part+1,parts);
+#if FHERMA_OVERLAP_DIAGNOSTIC
+        s.diag.mark(ari_overlap::crt_begin(part),nullptr);
+#endif
         check(s.crt->run(s.rc.ptr,s.c.ptr,first,last),"fused CRT stripe");
+#if FHERMA_OVERLAP_DIAGNOSTIC
+        s.diag.mark(ari_overlap::crt_begin(part)+1,nullptr);
+#endif
         if(download)check(cudaEventRecord(s.produced[part].handle,nullptr),"mark CRT stripe ready");
     }
+#if FHERMA_OVERLAP_DIAGNOSTIC
+    const auto resize_started=ari_overlap::Clock::now();
+#endif
     out.c.data.resize(words);
+#if FHERMA_OVERLAP_DIAGNOSTIC
+    sample.cpu[ari_overlap::ResizeC]=ari_overlap::ms(ari_overlap::Clock::now()-resize_started);
+    const auto register_c_started=ari_overlap::Clock::now();
+#endif
     const auto output_pages=registered.acquire(out.c.data.data(),bytes);
+#if FHERMA_OVERLAP_DIAGNOSTIC
+    sample.cpu[ari_overlap::RegisterC]=ari_overlap::ms(ari_overlap::Clock::now()-register_c_started);
+    sample.crt_ready_after_register=s.diag.query(ari_overlap::crt_begin(parts-1)+1);
+#endif
     for(unsigned part=0;part<parts;++part){
         const size_t first=size_t(part_boundary(p.N,part,parts))*p.L;
         const size_t last=size_t(part_boundary(p.N,part+1,parts))*p.L;
         auto* dst=reinterpret_cast<unsigned char*>(out.c.data.data()+first);
         const auto* src=reinterpret_cast<const unsigned char*>(s.c.ptr+first);
         if(download)check(cudaStreamWaitEvent(download,s.produced[part].handle,0),"wait for CRT stripe");
+#if FHERMA_OVERLAP_DIAGNOSTIC
+        if(part==0)s.diag.mark(ari_overlap::output_begin,download);
+#endif
         registered.for_chunks(dst,(last-first)*sizeof(uint32_t),[&](size_t offset,size_t amount){
             check(cudaMemcpyAsync(dst+offset,src+offset,amount,cudaMemcpyDeviceToHost,download),
                   "download registered CRT stripe");
         });
     }
+#if FHERMA_OVERLAP_DIAGNOSTIC
+    s.diag.mark(ari_overlap::output_end,download);
+    const auto input_wait_started=ari_overlap::Clock::now();
+#endif
     // Only the completed H2D copies read the borrowed inputs. No later
     // kernel uses those pages. Keep any registration shared with C until
     // the final D2H completes, even if C uses only a fragment of its range.
     check(cudaEventSynchronize(s.uploaded[0].handle),"wait for A host read");
     check(cudaEventSynchronize(s.uploaded[1].handle),"wait for B host read");
+#if FHERMA_OVERLAP_DIAGNOSTIC
+    sample.cpu[ari_overlap::InputEventWait]=ari_overlap::ms(ari_overlap::Clock::now()-input_wait_started);
+    const auto input_unreg_started=ari_overlap::Clock::now();
+#endif
     registered.release_inputs(output_pages);
+#if FHERMA_OVERLAP_DIAGNOSTIC
+    sample.cpu[ari_overlap::UnregisterInputs]=ari_overlap::ms(ari_overlap::Clock::now()-input_unreg_started);
+    const auto final_wait_started=ari_overlap::Clock::now();
+#endif
     fence.complete();
+#if FHERMA_OVERLAP_DIAGNOSTIC
+    sample.cpu[ari_overlap::FinalWait]=ari_overlap::ms(ari_overlap::Clock::now()-final_wait_started);
+    const auto output_unreg_started=ari_overlap::Clock::now();
+#endif
     registered.release_all();
+#if FHERMA_OVERLAP_DIAGNOSTIC
+    sample.cpu[ari_overlap::UnregisterC]=ari_overlap::ms(ari_overlap::Clock::now()-output_unreg_started);
+    sample.cpu[ari_overlap::BeforeCapture]=ari_overlap::ms(ari_overlap::Clock::now()-run_started);
+    s.diag.capture(sample);
+#endif
     return out;
 }
-void fherma_free(void* state) {delete static_cast<State*>(state);}
+void fherma_free(void* state) {
+    auto* s=static_cast<State*>(state);
+#if FHERMA_OVERLAP_DIAGNOSTIC
+    if(s)s->diag.report(s->plan.N,s->plan.W);
+#endif
+    delete s;
+}
