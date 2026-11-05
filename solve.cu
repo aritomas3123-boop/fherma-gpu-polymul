@@ -604,6 +604,9 @@ inline cudaError_t transform(uint32_t *a, uint32_t *b, const ari::Prime *primes,
 // The generated fherma.h and harness are supplied by FHERMA's example.
 #include <cuda_runtime.h>
 #include <memory>
+#include <chrono>
+#include <cstdio>
+#include <utility>
 #include <stdexcept>
 #include <string>
 #include <cstring>
@@ -1009,6 +1012,103 @@ struct State {
     std::unique_ptr<fherma_crt::DevicePlan> crt;
     explicit State(const fherma::Point& p):plan(p){}
 };
+
+#ifndef FHERMA_TRANSFER_CALIBRATION
+#define FHERMA_TRANSFER_CALIBRATION 1
+#endif
+
+// Setup-only microbenchmarks use synthetic, owned data and public dimensions.
+// They neither inspect operands nor precompute answers for a measured call.
+// These isolated durations are not an application profile or benchmark score.
+#if FHERMA_TRANSFER_CALIBRATION && FHERMA_PINNED_INPUT && FHERMA_PINNED_OUTPUT
+void calibrate_transfers(State& s) {
+    using Clock = std::chrono::steady_clock;
+    constexpr unsigned repeats=5;
+    const size_t words=size_t(s.plan.N)*s.plan.L, bytes=words*sizeof(uint32_t);
+    std::vector<uint32_t> source(words,0x51a7d3c9u), pageable_output(words,0u);
+    RunFence setup_fence; // Destroyed before synthetic vectors if a CUDA check throws.
+    std::memset(s.host_a.ptr,0,bytes);
+    std::memset(s.host_b.ptr,0,bytes);
+    std::memset(s.host_c.ptr,0,bytes);
+    check(cudaMemset(s.a.ptr,0,bytes),"calibration initialize a");
+    check(cudaMemset(s.b.ptr,0,bytes),"calibration initialize b");
+    check(cudaMemset(s.c.ptr,0,bytes),"calibration initialize c");
+    check(cudaStreamSynchronize(nullptr),"calibration initialize complete");
+
+    // A volatile reduction outside the clock keeps each CPU copy observable.
+    // Only synthetic words are consumed here; the value is never reported.
+    volatile uint32_t synthetic_sink=0;
+    auto consume=[&](const uint32_t* p) {
+        uint32_t fold=0;
+        for(size_t i=0;i<words;++i) fold^=p[i];
+        synthetic_sink=fold;
+    };
+    auto median=[](std::vector<double> times) {
+        std::sort(times.begin(),times.end());
+        return times[times.size()/2];
+    };
+    auto sample=[&](auto&& operation,auto&& inspect,bool gpu) {
+        std::vector<double> times;
+        times.reserve(repeats);
+        for(unsigned r=0;r<=repeats;++r) {
+            if(gpu)check(cudaStreamSynchronize(nullptr),"calibration before copy");
+            const auto begin=Clock::now();
+            operation();
+            if(gpu)check(cudaStreamSynchronize(nullptr),"calibration after copy");
+            const auto end=Clock::now();
+            if(r)times.push_back(std::chrono::duration<double,std::milli>(end-begin).count());
+            inspect();
+        }
+        return median(std::move(times));
+    };
+    const double cpu_to_pinned=sample([&]{
+        std::memcpy(s.host_a.ptr,source.data(),bytes);
+    },[&]{consume(s.host_a.ptr);},false);
+
+    // Reserve is outside this microbenchmark's clock, matching the real run's
+    // attempt to overlap reserve with GPU work. Each assign writes live final
+    // elements from pinned storage, with no preceding resize/zero-fill.
+    std::vector<double> assign_times;
+    assign_times.reserve(repeats);
+    for(unsigned r=0;r<=repeats;++r) {
+        std::vector<uint32_t> result;
+        result.reserve(words);
+        const auto begin=Clock::now();
+        result.assign(s.host_c.ptr,s.host_c.ptr+words);
+        const auto end=Clock::now();
+        if(r)assign_times.push_back(std::chrono::duration<double,std::milli>(end-begin).count());
+        consume(result.data());
+    }
+    const double cpu_from_pinned=median(std::move(assign_times));
+    const double pinned_h2d=sample([&]{
+        check(cudaMemcpyAsync(s.a.ptr,s.host_a.ptr,bytes,cudaMemcpyHostToDevice,nullptr),
+              "calibration pinned H2D");
+    },[]{},true);
+    const double pinned_d2h=sample([&]{
+        check(cudaMemcpyAsync(s.host_c.ptr,s.c.ptr,bytes,cudaMemcpyDeviceToHost,nullptr),
+              "calibration pinned D2H");
+    },[&]{consume(s.host_c.ptr);},true);
+    const double pageable_h2d=sample([&]{
+        check(cudaMemcpy(s.b.ptr,source.data(),bytes,cudaMemcpyHostToDevice),
+              "calibration pageable H2D");
+    },[]{},true);
+    const double pageable_d2h=sample([&]{
+        check(cudaMemcpy(pageable_output.data(),s.c.ptr,bytes,cudaMemcpyDeviceToHost),
+              "calibration pageable D2H");
+    },[&]{consume(pageable_output.data());},true);
+    setup_fence.complete();
+
+    std::fprintf(stderr,
+        "ari_setup_transfer_calibration synthetic_only=1 not_score=1 "
+        "N=%u W=%u words=%zu bytes_per_copy=%zu repetitions=%u "
+        "median_ms cpu_vector_to_pinned=%.6f cpu_pinned_to_reserved_assign=%.6f "
+        "pinned_h2d=%.6f pinned_d2h=%.6f pageable_h2d=%.6f pageable_d2h=%.6f\n",
+        s.plan.N,s.plan.W,words,bytes,repeats,cpu_to_pinned,cpu_from_pinned,
+        pinned_h2d,pinned_d2h,pageable_h2d,pageable_d2h);
+    std::fflush(stderr);
+    (void)synthetic_sink;
+}
+#endif
 } // namespace
 
 void* fherma_init(const fherma::Point& p) {
@@ -1034,6 +1134,9 @@ void* fherma_init(const fherma::Point& p) {
     std::vector<uint32_t> primes;for(auto prime:s->plan.primes)primes.push_back(prime.p);
     s->crt=std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes);
     check(cudaDeviceSynchronize(),"initialize GPU");
+#if FHERMA_TRANSFER_CALIBRATION && FHERMA_PINNED_INPUT && FHERMA_PINNED_OUTPUT
+    calibrate_transfers(*s);
+#endif
     return s.release();
 }
 
