@@ -829,18 +829,17 @@ using EncB=wmma::fragment<wmma::matrix_b,16,16,16,unsigned char,wmma::col_major>
 
 // Reorder coefficients by the NTT's initial bit permutation while packing;
 // the input remains unmodified. Padding is rewritten each run, not assumed.
-__global__ void pack_inputs(const std::uint32_t* __restrict__ a,
-    const std::uint32_t* __restrict__ b,std::uint8_t* __restrict__ dst,
-    unsigned n,unsigned l,unsigned bits) {
+__global__ void pack_operand(const std::uint32_t* __restrict__ input,
+    std::uint8_t* __restrict__ dst,unsigned n,unsigned l,unsigned bits,unsigned operand) {
     constexpr unsigned rows_per_cta=8;
     const unsigned row=blockIdx.x*rows_per_cta+threadIdx.x/16;
     const unsigned limb=blockIdx.y*16+threadIdx.x%16;
-    const unsigned np=round16(n),lp=round16(l),operand=blockIdx.z;
+    const unsigned np=round16(n),lp=round16(l);
     if(row>=np)return;
     std::uint32_t v=0;
     if(row<n&&limb<l) {
         const unsigned original=__brev(row)>>(32-bits);
-        v=(operand?b:a)[std::size_t(original)*l+limb];
+        v=input[std::size_t(original)*l+limb];
     }
     const unsigned out_row=operand*np+row;
     #pragma unroll
@@ -852,15 +851,14 @@ __global__ void pack_inputs(const std::uint32_t* __restrict__ a,
 // Store accumulator fragments column-major in shared so the modulus/twist
 // epilogue writes neighbouring coefficients to the same prime plane.
 __global__ void encode_gemm(const std::uint8_t* __restrict__ a,
-    const std::uint8_t* __restrict__ weights,std::uint32_t* __restrict__ ra,
-    std::uint32_t* __restrict__ rb,const ari::Prime* __restrict__ primes,
-    const ari_shoup::Weight* __restrict__ radix,const std::uint32_t* __restrict__ twist,
-    unsigned n,unsigned l,unsigned count) {
+    const std::uint8_t* __restrict__ weights,std::uint32_t* __restrict__ out,
+    const ari::Prime* __restrict__ primes,const ari_shoup::Weight* __restrict__ radix,
+    const std::uint32_t* __restrict__ twist,unsigned n,unsigned l,unsigned count,unsigned operand) {
     constexpr unsigned warps=4;
     const unsigned lane=threadIdx.x%32,warp=threadIdx.x/32;
     const unsigned r0=blockIdx.x*16,k0=(blockIdx.y*warps+warp)*16;
     if(k0>=count)return;  // uniform within warp, no CTA-wide barriers
-    const unsigned np=round16(n),kp=round16(count),lp=round16(l),operand=blockIdx.z;
+    const unsigned np=round16(n),kp=round16(count),lp=round16(l);
     EncAcc diag[7];
     #pragma unroll
     for(unsigned d=0;d<7;++d)wmma::fill_fragment(diag[d],0);
@@ -891,7 +889,6 @@ __global__ void encode_gemm(const std::uint8_t* __restrict__ a,
     for(unsigned d=0;d<3;++d)
         wmma::store_matrix_sync(words[warp][d],diag[d],16,wmma::mem_col_major);
     __syncwarp();
-    std::uint32_t* out=operand?rb:ra;
     #pragma unroll
     for(unsigned elem=lane;elem<256;elem+=32) {
         const unsigned k=k0+elem/16,r=r0+elem%16;
@@ -907,18 +904,19 @@ __global__ void encode_gemm(const std::uint8_t* __restrict__ a,
 }
 // packed_inputs needs 4 * (2*round16(n)) * round16(l) bytes. packed_weights
 // needs 4 * round16(count) * round16(l) bytes, zeroed outside its true shape.
-inline cudaError_t launch(const std::uint32_t *a,const std::uint32_t *b,
-    std::uint32_t *ra,std::uint32_t *rb,std::uint8_t *packed_inputs,
+inline cudaError_t launch_operand(const std::uint32_t *input,std::uint32_t *residues,
+    unsigned operand,std::uint8_t *packed_inputs,
     const std::uint8_t *packed_weights,const ari::Prime *primes,
     const ari_shoup::Weight *radix_shoup,const std::uint32_t *twist_reversed,
     unsigned n,unsigned limbs,unsigned log_n,unsigned count,cudaStream_t stream=nullptr) {
     if(n<2||n>65536||(n&(n-1))||!limbs||limbs>55||!count||
-       log_n>16||(1u<<log_n)!=n)return cudaErrorInvalidValue;
-    pack_inputs<<<dim3(round16(n)/8,round16(limbs)/16,2),128,0,stream>>>
-        (a,b,packed_inputs,n,limbs,log_n);
+       log_n>16||(1u<<log_n)!=n||operand>1)return cudaErrorInvalidValue;
+    // Each branch reads/writes only its own N padded rows in every panel.
+    pack_operand<<<dim3(round16(n)/8,round16(limbs)/16),128,0,stream>>>
+        (input,packed_inputs,n,limbs,log_n,operand);
     auto status=cudaGetLastError();if(status!=cudaSuccess)return status;
-    encode_gemm<<<dim3(round16(n)/16,(count+63)/64,2),128,0,stream>>>
-       (packed_inputs,packed_weights,ra,rb,primes,radix_shoup,twist_reversed,n,limbs,count);
+    encode_gemm<<<dim3(round16(n)/16,(count+63)/64),128,0,stream>>>
+       (packed_inputs,packed_weights,residues,primes,radix_shoup,twist_reversed,n,limbs,count,operand);
     return cudaGetLastError();
 }
 } // namespace ari_wmma_encoder
@@ -950,30 +948,41 @@ template<class T> struct HostBuffer {
         check(cudaHostAlloc(reinterpret_cast<void**>(&ptr),n*sizeof(T),flags),"cudaHostAlloc staging");
     }
 };
-// An exception must not leave DMA reading a staging buffer while a subsequent
-// call overwrites it. The normal path reports stream errors before returning.
+struct OperandStream {
+    cudaStream_t handle=nullptr;
+    OperandStream(){
+        check(cudaStreamCreateWithFlags(&handle,cudaStreamNonBlocking),"create A stream");
+    }
+    OperandStream(const OperandStream&)=delete;
+    ~OperandStream(){if(handle)cudaStreamDestroy(handle);}
+};
+struct ForwardReady {
+    cudaEvent_t handle=nullptr;
+    ForwardReady(){
+        check(cudaEventCreateWithFlags(&handle,cudaEventDisableTiming),"create A ready event");
+    }
+    ForwardReady(const ForwardReady&)=delete;
+    ~ForwardReady(){if(handle)cudaEventDestroy(handle);}
+};
+// The normal output stream joins A before pointwise multiplication. Before
+// that join, a partial failure may have submitted work on either stream.
 struct RunFence {
     bool completed=false;
-    RunFence()=default;
+    cudaStream_t operand_a;
+    explicit RunFence(cudaStream_t a):operand_a(a){}
     RunFence(const RunFence&)=delete;
-    ~RunFence(){if(!completed)cudaStreamSynchronize(nullptr);}
+    ~RunFence(){
+        if(!completed){
+            cudaStreamSynchronize(operand_a);
+            cudaStreamSynchronize(nullptr);
+        }
+    }
     void complete(){
         check(cudaStreamSynchronize(nullptr),"complete measured work");
+        check(cudaStreamSynchronize(operand_a),"check A stream completion");
         completed=true;
     }
 };
-#if !FHERMA_NTT_TILED
-__global__ void forward_stage(uint32_t* a,uint32_t* b,const ari::Prime* primes,
-                              const uint32_t* roots,unsigned N,unsigned half) {
-    const unsigned t=blockIdx.x*blockDim.x+threadIdx.x,k=blockIdx.y;
-    if(t>=N/2)return;
-    const unsigned j=t%half, i=(t/half)*(2*half)+j;
-    const size_t base=size_t(k)*N;
-    const auto p=primes[k]; const auto w=roots[size_t(k)*(N/2)+j*(N/(2*half))];
-    uint32_t x=a[base+i],y=a[base+i+half]; ari::butterfly(x,y,w,p);a[base+i]=x;a[base+i+half]=y;
-    x=b[base+i];y=b[base+i+half];ari::butterfly(x,y,w,p);b[base+i]=x;b[base+i+half]=y;
-}
-#endif
 __global__ void multiply_reverse(const uint32_t* a,const uint32_t* b,uint32_t* c,
                                  const ari::Prime* primes,unsigned N,unsigned logN) {
     const unsigned i=blockIdx.x*blockDim.x+threadIdx.x,k=blockIdx.y;if(i>=N)return;
@@ -981,7 +990,7 @@ __global__ void multiply_reverse(const uint32_t* a,const uint32_t* b,uint32_t* c
     c[size_t(k)*N+ari::reverse_bits(i,logN)]=ari::mont(a[at],b[at],primes[k]);
 }
 #if !FHERMA_NTT_TILED
-__global__ void inverse_stage(uint32_t* a,const ari::Prime* primes,const uint32_t* roots,
+__global__ void single_stage(uint32_t* a,const ari::Prime* primes,const uint32_t* roots,
                               unsigned N,unsigned half) {
     const unsigned t=blockIdx.x*blockDim.x+threadIdx.x,k=blockIdx.y;if(t>=N/2)return;
     const unsigned j=t%half,i=(t/half)*(2*half)+j; const size_t base=size_t(k)*N;
@@ -996,6 +1005,8 @@ __global__ void decode(uint32_t* a,const ari::Prime* primes,const uint32_t* untw
 }
 struct State {
     ari::Plan plan;
+    OperandStream stream_a;
+    ForwardReady forward_a;
     Buffer<uint32_t> a,b,c,ra,rb,rc,roots,inverse_roots,twist,untwist;
     Buffer<ari::Prime> primes;
     Buffer<uint8_t> packed_inputs, packed_weights;
@@ -1041,40 +1052,46 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     auto& s=*static_cast<State*>(state);const auto& p=s.plan;
     const size_t words=size_t(p.N)*p.L,bytes=words*sizeof(uint32_t);
     if(in.a.data.size()!=words||in.b.data.size()!=words)throw std::runtime_error("input size does not match point");
-    RunFence fence;
-#if FHERMA_PINNED_INPUT
-    std::memcpy(s.host_a.ptr,in.a.data.data(),bytes);
-    check(cudaMemcpyAsync(s.a.ptr,s.host_a.ptr,bytes,cudaMemcpyHostToDevice,nullptr),"upload staged a");
-    // This host copy can overlap the preceding A DMA. B is not enqueued
-    // until its staging copy has finished; all GPU work stays in stream zero.
-    std::memcpy(s.host_b.ptr,in.b.data.data(),bytes);
-    check(cudaMemcpyAsync(s.b.ptr,s.host_b.ptr,bytes,cudaMemcpyHostToDevice,nullptr),"upload staged b");
-#else
-    check(cudaMemcpy(s.a.ptr,in.a.data.data(),bytes,cudaMemcpyHostToDevice),"upload a");
-    check(cudaMemcpy(s.b.ptr,in.b.data.data(),bytes,cudaMemcpyHostToDevice),"upload b");
-#endif
+    RunFence fence(s.stream_a.handle);
     const dim3 grid((p.N+255)/256,p.K);
 #if !FHERMA_NTT_TILED
     const dim3 butterflies((p.N/2+255)/256,p.K);
 #endif
-    check(ari_wmma_encoder::launch(s.a.ptr,s.b.ptr,s.ra.ptr,s.rb.ptr,
-          s.packed_inputs.ptr,s.packed_weights.ptr,s.primes.ptr,s.radix.ptr,
-          s.twist.ptr,p.N,p.L,p.logN,p.K),"encode integer Tensor Cores");
-#if FHERMA_NTT_TILED
-    check(ari_tile::transform<true>(s.ra.ptr,s.rb.ptr,s.primes.ptr,s.roots.ptr,p.N,p.K),"tiled forward NTT");
-#else
-    for(unsigned half=1;half<p.N;half*=2) {
-        forward_stage<<<butterflies,256>>>(s.ra.ptr,s.rb.ptr,s.primes.ptr,s.roots.ptr,p.N,half);
-        check(cudaGetLastError(),"forward NTT launch");
-    }
+    auto submit_operand=[&](unsigned operand,const uint32_t* input,cudaStream_t stream){
+        uint32_t* device=operand?s.b.ptr:s.a.ptr;
+        uint32_t* residues=operand?s.rb.ptr:s.ra.ptr;
+#if FHERMA_PINNED_INPUT
+        uint32_t* stage=operand?s.host_b.ptr:s.host_a.ptr;
+        std::memcpy(stage,input,bytes);
+        input=stage;
 #endif
+        check(cudaMemcpyAsync(device,input,bytes,cudaMemcpyHostToDevice,stream),"upload operand");
+        check(ari_wmma_encoder::launch_operand(device,residues,operand,s.packed_inputs.ptr,
+            s.packed_weights.ptr,s.primes.ptr,s.radix.ptr,s.twist.ptr,
+            p.N,p.L,p.logN,p.K,stream),"encode operand");
+#if FHERMA_NTT_TILED
+        // The template selects the number of arrays. The roots select direction.
+        check(ari_tile::transform<false>(residues,nullptr,s.primes.ptr,s.roots.ptr,
+                                        p.N,p.K,stream),"single-operand forward NTT");
+#else
+        for(unsigned half=1;half<p.N;half*=2){
+            single_stage<<<butterflies,256,0,stream>>>(residues,s.primes.ptr,s.roots.ptr,p.N,half);
+            check(cudaGetLastError(),"single-operand forward stage");
+        }
+#endif
+    };
+    submit_operand(0,in.a.data.data(),s.stream_a.handle);
+    check(cudaEventRecord(s.forward_a.handle,s.stream_a.handle),"mark A transform complete");
+    // This CPU staging copy and the B upload may overlap A's encoder/NTT.
+    submit_operand(1,in.b.data.data(),nullptr);
+    check(cudaStreamWaitEvent(nullptr,s.forward_a.handle,0),"join A and B before product");
     multiply_reverse<<<grid,256>>>(s.ra.ptr,s.rb.ptr,s.rc.ptr,s.primes.ptr,p.N,p.logN);
     check(cudaGetLastError(),"multiply launch");
 #if FHERMA_NTT_TILED
     check(ari_tile::transform<false>(s.rc.ptr,nullptr,s.primes.ptr,s.inverse_roots.ptr,p.N,p.K),"tiled inverse NTT");
 #else
     for(unsigned half=1;half<p.N;half*=2) {
-        inverse_stage<<<butterflies,256>>>(s.rc.ptr,s.primes.ptr,s.inverse_roots.ptr,p.N,half);
+        single_stage<<<butterflies,256>>>(s.rc.ptr,s.primes.ptr,s.inverse_roots.ptr,p.N,half);
         check(cudaGetLastError(),"inverse NTT launch");
     }
 #endif
@@ -1094,7 +1111,7 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
 #else
     out.c.data.resize(words);
     check(cudaMemcpy(out.c.data.data(),s.c.ptr,bytes,cudaMemcpyDeviceToHost),"download result");
-    fence.completed=true; // Blocking D2H completed all preceding stream work.
+    fence.complete();
 #endif
     return out;
 }
