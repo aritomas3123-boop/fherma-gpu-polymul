@@ -1,0 +1,26 @@
+name: Alex exact fused CRT compile checks
+on:
+  push:
+    branches: [experiment-alex-fused-crt-20261111]
+  workflow_dispatch:
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        fusion: [ON, OFF]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install C++ build tools
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cmake make g++
+      - name: Compile exact CRT fusion and control for Blackwell sm_120
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFHERMA_CUDA_ARCH=sm_120 -DFHERMA_NTT_TILED=ON -DFHERMA_FUSED_REINDEX=OFF -DFHERMA_PROFILE=OFF -DFHERMA_CRT_TILE_X=16 -DFHERMA_ALEX_FUSED_CRT=${{ matrix.fusion }}
+          cmake --build build -j 2
+          ls -lh build/solution
