@@ -1,0 +1,25 @@
+name: Experimental CUDA 12.8 compilation (no GPU)
+on:
+  push:
+    branches: [research-fused-reindex-no-profiler]
+  workflow_dispatch:
+jobs:
+  compile:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compiler dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cmake make g++ nodejs
+      - name: Check deterministic permutation on CPU
+        run: node verify-reindex.js
+      - name: Compile CUDA variant (no GPU in runner)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFHERMA_CUDA_ARCH=sm_120 -DFHERMA_FUSED_REINDEX=ON -DFHERMA_PROFILE=OFF
+          cmake --build build -j 2
+      - name: Print artifact details
+        run: ls -lh build/solution
