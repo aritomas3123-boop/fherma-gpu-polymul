@@ -417,11 +417,18 @@ namespace fherma_crt {
 #define FHERMA_CRT_TILE_X 16
 #endif
 static_assert(FHERMA_CRT_TILE_X == 16 || FHERMA_CRT_TILE_X == 32, "CRT tile width must be 16 or 32");
+#ifndef FHERMA_ALEX_FUSED_CRT
+#define FHERMA_ALEX_FUSED_CRT 1
+#endif
 constexpr unsigned tile_x = FHERMA_CRT_TILE_X;
 constexpr unsigned tile_y = 8;
 
 struct DeviceArgs {
     unsigned n, limbs, bits, count;
+#if FHERMA_ALEX_FUSED_CRT
+    const u32 *fused_factors;
+    const ari::Prime *mont_primes;
+#endif
     u32 gap;
     PrimeInfo *primes;
     u32 *weights, *q;
@@ -438,7 +445,17 @@ __global__ void reconstruct_kernel(DeviceArgs plan, const u32 *residues, u32 *ou
     bool active = coef < plan.n;
     for (unsigned j = y; j < k; j += tile_y) {
         u32 r = active ? residues[std::size_t(j) * plan.n + coef] : 0;
+        #if FHERMA_ALEX_FUSED_CRT
+        // The inverse NTT leaves r in Montgomery form.
+        // fused_factors = (N^-1 * psi^-coef * CRT_basis_inverse) mod p,
+        // stored in ordinary representation, so one Montgomery multiply
+        // replaces decode's two multiplies plus CRT's Shoup weighting.
+        terms[j * tile_x + x] = active ? ari::mont(
+            r, plan.fused_factors[std::size_t(j) * plan.n + coef],
+            plan.mont_primes[j]) : 0;
+#else
         terms[j * tile_x + x] = weight_residue(r, plan.primes[j]);
+#endif
     }
     __syncthreads();
     if (y == 0) {
@@ -472,9 +489,18 @@ class DevicePlan {
         if (args_.primes) cudaFree(args_.primes);
         if (args_.weights) cudaFree(args_.weights);
         if (args_.q) cudaFree(args_.q);
+#if FHERMA_ALEX_FUSED_CRT
+        if (args_.fused_factors) cudaFree(const_cast<u32*>(args_.fused_factors));
+        if (args_.mont_primes) cudaFree(const_cast<ari::Prime*>(args_.mont_primes));
+#endif
     }
 public:
-    DevicePlan(unsigned n, const u32 *q, unsigned limbs, const std::vector<u32>& primes) {
+    DevicePlan(unsigned n, const u32 *q, unsigned limbs, const std::vector<u32>& primes
+#if FHERMA_ALEX_FUSED_CRT
+            , const std::vector<ari::Prime>& mont_primes,
+            const std::vector<u32>& untwist_mont
+#endif
+            ) {
         HostPlan plan = make_plan(n, q, limbs, primes);
         args_.n = n; args_.limbs = limbs; args_.bits = plan.bits;
         args_.count = unsigned(primes.size()); args_.gap = plan.gap;
@@ -493,7 +519,34 @@ public:
                 cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared_));
             if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
         }
-        try { upload(args_.primes, plan.primes); upload(args_.weights, plan.weights); upload(args_.q, plan.q); }
+#if FHERMA_ALEX_FUSED_CRT
+        if (mont_primes.size() != primes.size() ||
+            untwist_mont.size() != std::size_t(n) * primes.size())
+            throw std::invalid_argument("fused CRT parameter dimensions mismatch");
+        std::vector<u32> factors(untwist_mont.size());
+        for (std::size_t j = 0; j < mont_primes.size(); ++j) {
+            if (mont_primes[j].p != primes[j]) throw std::invalid_argument("fused CRT prime order mismatch");
+            const u32 inv = plan.primes[j].inv;
+            for (unsigned i = 0; i < n; ++i) {
+                // untwist_mont represents s*R mod p. Mont(x,1) gives ordinary s.
+                // Original term: Mont(Mont(raw,untwist_mont),1) * inv mod p.
+                // Fused term: Mont(raw, (s*inv mod p)).
+                const u32 s = ari::mont(untwist_mont[j * n + i], 1, mont_primes[j]);
+                factors[j * n + i] = u32(u64(s) * inv % primes[j]);
+            }
+        }
+#endif
+        try {
+            upload(args_.primes, plan.primes); upload(args_.weights, plan.weights); upload(args_.q, plan.q);
+#if FHERMA_ALEX_FUSED_CRT
+            u32 *gpu_factors=nullptr;
+            ari::Prime *gpu_mont_primes=nullptr;
+            upload(gpu_factors, factors);
+            args_.fused_factors = gpu_factors;
+            upload(gpu_mont_primes, mont_primes);
+            args_.mont_primes = gpu_mont_primes;
+#endif
+        }
         catch (...) { release(); throw; }
     }
     DevicePlan(const DevicePlan&) = delete;
@@ -874,9 +927,16 @@ void* fherma_init(const fherma::Point& p) {
     s->ra.alloc(residues);s->rb.alloc(residues);s->rc.alloc(residues);
     s->weights.copy(ari_shoup::make_weights(s->plan.primes,p.L));
     s->primes.copy(s->plan.primes);s->roots.copy(s->plan.roots);
-    s->inverse_roots.copy(s->plan.inverse_roots);s->twist.copy(ari_shoup::reorder_twists(s->plan.twist,p.N,s->plan.logN));s->untwist.copy(s->plan.untwist);
+    s->inverse_roots.copy(s->plan.inverse_roots);s->twist.copy(ari_shoup::reorder_twists(s->plan.twist,p.N,s->plan.logN));
+#if !FHERMA_ALEX_FUSED_CRT
+    s->untwist.copy(s->plan.untwist);
+#endif
     std::vector<uint32_t> primes;for(auto prime:s->plan.primes)primes.push_back(prime.p);
-    s->crt=std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes);
+    s->crt=std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes
+#if FHERMA_ALEX_FUSED_CRT
+        , s->plan.primes, s->plan.untwist
+#endif
+        );
     check(cudaDeviceSynchronize(),"initialize GPU");
     return s.release();
 }
@@ -921,8 +981,10 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     }
 #endif
     s.prof.mark(4);
+#if !FHERMA_ALEX_FUSED_CRT
     decode<<<grid,256>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
     check(cudaGetLastError(),"decode launch");
+#endif
     s.prof.mark(5);
     check(s.crt->run(s.rc.ptr,s.c.ptr),"CRT launch");
     s.prof.mark(6);
