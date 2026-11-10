@@ -1,0 +1,32 @@
+name: Automated NTT geometry CUDA compile checks
+on:
+  push:
+    branches: [autotune-ntt-search-20261111]
+  workflow_dispatch:
+jobs:
+  screen:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: control-512, tile: 512, columns: 16, workers: 16}
+          - {name: tile-256, tile: 256, columns: 16, workers: 16}
+          - {name: tile-1024, tile: 1024, columns: 16, workers: 16}
+          - {name: columns-32, tile: 512, columns: 32, workers: 8}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install C++ build tools
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cmake make g++ nodejs
+      - name: Screen search candidates
+        run: node autotune/search.js > /tmp/fherma-autotune.json && head -25 /tmp/fherma-autotune.json
+      - name: Compile Blackwell sm_120 variant (no GPU on CI)
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFHERMA_CUDA_ARCH=sm_120 -DFHERMA_NTT_TILED=ON -DFHERMA_FUSED_REINDEX=OFF -DFHERMA_PROFILE=OFF -DFHERMA_CRT_TILE_X=16 -DFHERMA_NTT_MAX_TILE=${{ matrix.tile }} -DFHERMA_NTT_LOW_COLUMNS=${{ matrix.columns }} -DFHERMA_NTT_HIGH_WORKERS=${{ matrix.workers }}
+          cmake --build build -j 2
+          ls -lh build/solution
