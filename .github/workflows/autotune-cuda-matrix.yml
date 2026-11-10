@@ -1,0 +1,49 @@
+name: Bounded CUDA autotuning compilation (no GPU)
+on:
+  push:
+    branches: [research-auto-tune-ntt-crt]
+  workflow_dispatch:
+jobs:
+  compile-grid:
+    strategy:
+      fail-fast: false
+      matrix:
+        ntt_tile: [256, 512, 1024]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install CUDA build dependencies
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cmake make g++ nodejs
+      - name: Check exact input bit-reversal mapping on CPU
+        run: node verify-reindex.js
+      - name: Compile four independent NTT+CRT candidates
+        shell: bash
+        run: |
+          set -euo pipefail
+          for columns in 8 16; do
+            for crt in 16 32; do
+              name="ntt-${{ matrix.ntt_tile }}-col-${columns}-crt-${crt}"
+              echo "::group::${name}"
+              cmake -S . -B "build/${name}" -DCMAKE_BUILD_TYPE=Release \
+                -DFHERMA_CUDA_ARCH=sm_120 \
+                -DFHERMA_NTT_TILE=${{ matrix.ntt_tile }} \
+                -DFHERMA_NTT_COLUMNS=${columns} \
+                -DFHERMA_NTT_WORKERS=16 \
+                -DFHERMA_CRT_TILE_X=${crt} \
+                -DFHERMA_NTT_TILED=ON \
+                -DFHERMA_FUSED_REINDEX=OFF \
+                -DFHERMA_PROFILE=OFF
+              cmake --build "build/${name}" -j 2
+              echo "${name},compiled" >> compiled.csv
+              echo "::endgroup::"
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compiled-grid-tile-${{ matrix.ntt_tile }}
+          path: compiled.csv
