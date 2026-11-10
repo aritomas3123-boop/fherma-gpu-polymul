@@ -516,9 +516,24 @@ public:
 // arrays) and inverse (one array). Twiddles are in the existing plan's Montgomery
 // representation. Data layout and standard-butterfly order are unchanged.
 namespace ari_tile {
-constexpr unsigned max_tile = 512;
-constexpr unsigned low_columns = 16;
-constexpr unsigned high_workers = 16;
+#ifndef FHERMA_NTT_TILE
+#define FHERMA_NTT_TILE 512
+#endif
+#ifndef FHERMA_NTT_COLUMNS
+#define FHERMA_NTT_COLUMNS 16
+#endif
+#ifndef FHERMA_NTT_WORKERS
+#define FHERMA_NTT_WORKERS 16
+#endif
+static_assert(FHERMA_NTT_TILE == 256 || FHERMA_NTT_TILE == 512 || FHERMA_NTT_TILE == 1024,
+              "NTT tile must be 256, 512 or 1024");
+static_assert(FHERMA_NTT_COLUMNS == 8 || FHERMA_NTT_COLUMNS == 16,
+              "NTT columns must be 8 or 16");
+static_assert(FHERMA_NTT_WORKERS == 8 || FHERMA_NTT_WORKERS == 16,
+              "NTT workers must be 8 or 16");
+constexpr unsigned max_tile = FHERMA_NTT_TILE;
+constexpr unsigned low_columns = FHERMA_NTT_COLUMNS;
+constexpr unsigned high_workers = FHERMA_NTT_WORKERS;
 
 struct Pair { unsigned first, second, root; };
 FHD inline Pair low_pair(unsigned t, unsigned half, unsigned n) {
