@@ -1,7 +1,7 @@
 name: Experimental CUDA 12.8 compilation (no GPU)
 on:
   push:
-    branches: [research-fused-reindex-no-profiler]
+    branches: [research-fused-reindex-no-profiler, experiment-crt-warp32]
   workflow_dispatch:
 jobs:
   compile:
@@ -19,7 +19,9 @@ jobs:
         run: node verify-reindex.js
       - name: Compile CUDA variant (no GPU in runner)
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFHERMA_CUDA_ARCH=sm_120 -DFHERMA_FUSED_REINDEX=ON -DFHERMA_PROFILE=OFF
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFHERMA_CUDA_ARCH=sm_120 -DFHERMA_FUSED_REINDEX=OFF -DFHERMA_PROFILE=OFF -DFHERMA_CRT_TILE_X=32
           cmake --build build -j 2
+          cmake -S . -B build-control -DCMAKE_BUILD_TYPE=Release -DFHERMA_CUDA_ARCH=sm_120 -DFHERMA_FUSED_REINDEX=OFF -DFHERMA_PROFILE=OFF -DFHERMA_CRT_TILE_X=16
+          cmake --build build-control -j 2
       - name: Print artifact details
         run: ls -lh build/solution
