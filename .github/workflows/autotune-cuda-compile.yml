@@ -17,6 +17,7 @@ jobs:
           - {name: tile-256, tile: 256, columns: 16, workers: 16}
           - {name: tile-1024, tile: 1024, columns: 16, workers: 16}
           - {name: columns-32, tile: 512, columns: 32, workers: 8}
+          - {name: tile1024-cols32, tile: 1024, columns: 32, workers: 8}
     steps:
       - uses: actions/checkout@v4
       - name: Install C++ build tools
