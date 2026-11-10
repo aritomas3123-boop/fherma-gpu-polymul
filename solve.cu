@@ -516,9 +516,26 @@ public:
 // arrays) and inverse (one array). Twiddles are in the existing plan's Montgomery
 // representation. Data layout and standard-butterfly order are unchanged.
 namespace ari_tile {
-constexpr unsigned max_tile = 512;
-constexpr unsigned low_columns = 16;
-constexpr unsigned high_workers = 16;
+#ifndef FHERMA_NTT_MAX_TILE
+#define FHERMA_NTT_MAX_TILE 512
+#endif
+#ifndef FHERMA_NTT_LOW_COLUMNS
+#define FHERMA_NTT_LOW_COLUMNS 16
+#endif
+#ifndef FHERMA_NTT_HIGH_WORKERS
+#define FHERMA_NTT_HIGH_WORKERS 16
+#endif
+static_assert(FHERMA_NTT_MAX_TILE == 256 || FHERMA_NTT_MAX_TILE == 512 || FHERMA_NTT_MAX_TILE == 1024,
+              "NTT tile must be 256, 512 or 1024");
+static_assert(FHERMA_NTT_LOW_COLUMNS == 8 || FHERMA_NTT_LOW_COLUMNS == 16 || FHERMA_NTT_LOW_COLUMNS == 32,
+              "NTT low columns must be 8, 16 or 32");
+static_assert(FHERMA_NTT_HIGH_WORKERS == 4 || FHERMA_NTT_HIGH_WORKERS == 8 || FHERMA_NTT_HIGH_WORKERS == 16 || FHERMA_NTT_HIGH_WORKERS == 32,
+              "NTT high workers must be 4, 8, 16 or 32");
+static_assert(FHERMA_NTT_LOW_COLUMNS * FHERMA_NTT_HIGH_WORKERS <= 1024,
+              "NTT high stage block exceeds CUDA threads per block");
+constexpr unsigned max_tile = FHERMA_NTT_MAX_TILE;
+constexpr unsigned low_columns = FHERMA_NTT_LOW_COLUMNS;
+constexpr unsigned high_workers = FHERMA_NTT_HIGH_WORKERS;
 
 struct Pair { unsigned first, second, root; };
 FHD inline Pair low_pair(unsigned t, unsigned half, unsigned n) {
@@ -557,8 +574,8 @@ __global__ void low_stages(uint32_t *a, uint32_t *b, const ari::Prime *primes,
 template<bool Two>
 __global__ void high_stages(uint32_t *a, uint32_t *b, const ari::Prime *primes,
                             const uint32_t *roots, unsigned n) {
-    // If index = h * 512 + low, all stages with half >= 512 keep "low"
-    // constant. Compute 16 adjacent low columns together to coalesce loads.
+    // If index = h * max_tile + low, all stages with half >= 512 keep "low"
+    // constant. Compute adjacent low columns together to coalesce loads.
     extern __shared__ uint32_t data[];
     const unsigned high_count = n / max_tile;
     uint32_t *sa = data, *sb = data + high_count * low_columns;
