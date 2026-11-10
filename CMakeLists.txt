@@ -15,12 +15,14 @@ else()
   set(FHERMA_CUDA_ARCH native CACHE STRING "nvcc -arch value; sm_120 for the current competition runner")
   add_executable(solution main.cpp solve.cu)
   option(FHERMA_NTT_TILED "Fuse NTT stages in shared-memory tiles" ON)
-  option(FHERMA_FUSED_REINDEX "Experiment: fuse bit-reversal input gather into encoding" ON)
+  option(FHERMA_FUSED_REINDEX "Experiment: fuse bit-reversal input gather into encoding" OFF)
+  set(FHERMA_CRT_TILE_X 32 CACHE STRING "CRT coefficients per block, 16 (baseline) or 32 (experiment)")
   option(FHERMA_PROFILE "Enable GPU stage profiling (adds timing overhead)" OFF)
   target_compile_definitions(solution PRIVATE
     FHERMA_NTT_TILED=$<BOOL:${FHERMA_NTT_TILED}>
     FHERMA_FUSED_REINDEX=$<BOOL:${FHERMA_FUSED_REINDEX}>
-    FHERMA_PROFILE=$<BOOL:${FHERMA_PROFILE}>)
+    FHERMA_PROFILE=$<BOOL:${FHERMA_PROFILE}>
+    FHERMA_CRT_TILE_X=${FHERMA_CRT_TILE_X})
   set_target_properties(solution PROPERTIES CUDA_ARCHITECTURES OFF)
   target_compile_options(solution PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-arch=${FHERMA_CUDA_ARCH}>)
 endif()
