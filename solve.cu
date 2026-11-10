@@ -671,6 +671,9 @@ FHD inline void convert_both(const uint32_t *a, const uint32_t *b,
 }
 } // namespace ari_shoup
 #include <cuda_runtime.h>
+#ifndef FHERMA_FUSED_REINDEX
+#define FHERMA_FUSED_REINDEX 0
+#endif
 namespace ari_shoup {
 constexpr unsigned warp_size = 32, reindex_rows = 8, group_primes = 8;
 // Bit reversal is an involution. A single warp owns each pair (i,r) with
@@ -691,7 +694,7 @@ __global__ void reindex(uint32_t *a,uint32_t *b,unsigned n,unsigned l,unsigned b
 // stride. Twists are permuted at setup, solely from point parameters.
 __global__ void encode_tiled(const uint32_t *ar,const uint32_t *br,uint32_t *ra,uint32_t *rb,
                              const ari::Prime *primes,const Weight *weights,
-                             const uint32_t *reversed_twist,unsigned n,unsigned l,unsigned count) {
+                             const uint32_t *reversed_twist,unsigned n,unsigned l,unsigned bits,unsigned count) {
     extern __shared__ uint32_t stage[];
     const unsigned stride=l|1u;
     uint32_t *sa=stage, *sb=stage+warp_size*stride;
@@ -700,7 +703,14 @@ __global__ void encode_tiled(const uint32_t *ar,const uint32_t *br,uint32_t *ra,
     const unsigned valid=(n-start<warp_size)?n-start:warp_size;
     for(unsigned t=y*warp_size+x;t<valid*l;t+=warp_size*group_primes) {
         unsigned row=t/l,col=t-row*l;
-        std::size_t off=std::size_t(start)*l+t;
+        #if FHERMA_FUSED_REINDEX
+        // Reversal is a permutation of coefficients. Gather input rows directly
+        // in the desired order instead of reordering both full input arrays in global memory.
+        unsigned src_row = ari::reverse_bits(start + row, bits);
+        std::size_t off = std::size_t(src_row) * l + col;
+#else
+        std::size_t off = std::size_t(start) * l + t;
+#endif
         sa[row*stride+col]=ar[off]; sb[row*stride+col]=br[off];
     }
     __syncthreads();
@@ -726,12 +736,14 @@ inline cudaError_t launch(uint32_t *a,uint32_t *b,
                           const uint32_t *twist_reversed,unsigned n,unsigned l,unsigned bits,
                           unsigned count,cudaStream_t stream=nullptr) {
     if(n<2||n>65536||(n&(n-1))||!l||l>55||!count) return cudaErrorInvalidValue;
+#if !FHERMA_FUSED_REINDEX
     reindex<<<(n+reindex_rows-1)/reindex_rows,dim3(warp_size,reindex_rows),0,stream>>>(a,b,n,l,bits);
     cudaError_t st=cudaGetLastError();
     if(st!=cudaSuccess)return st;
+#endif
     size_t shared_bytes=2*warp_size*(l|1u)*sizeof(uint32_t);
     encode_tiled<<<dim3((n+warp_size-1)/warp_size,(count+group_primes-1)/group_primes),
-        dim3(warp_size,group_primes),shared_bytes,stream>>>(a,b,ra,rb,ps,weights,twist_reversed,n,l,count);
+        dim3(warp_size,group_primes),shared_bytes,stream>>>(a,b,ra,rb,ps,weights,twist_reversed,n,l,bits,count);
     return cudaGetLastError();
 }
 } // namespace ari_shoup
@@ -788,6 +800,10 @@ double profile_ms(ProfileClock::duration d) {
 }
 // Development build only: events, one extra sync and host measurements alter the
 // wall clock. We emit aggregate durations, never inputs or computed coefficients.
+#ifndef FHERMA_PROFILE
+#define FHERMA_PROFILE 0
+#endif
+#if FHERMA_PROFILE
 struct StageProfile {
     cudaEvent_t event[7]{};
     std::vector<std::array<double, 9>> calls;
@@ -820,6 +836,14 @@ struct StageProfile {
         std::fprintf(stderr,"\n"); std::fflush(stderr);
     }
 };
+#else
+struct StageProfile {
+    void mark(unsigned) {}
+    void complete_compute() {}
+    void capture(double,double,double) {}
+    void report(unsigned,unsigned) {}
+};
+#endif
 struct State {
     ari::Plan plan;
     StageProfile prof;
@@ -852,7 +876,9 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     auto t0=ProfileClock::now();
     check(cudaMemcpy(s.a.ptr,in.a.data.data(),bytes,cudaMemcpyHostToDevice),"upload a");
     check(cudaMemcpy(s.b.ptr,in.b.data.data(),bytes,cudaMemcpyHostToDevice),"upload b");
+#if FHERMA_PROFILE
     check(cudaStreamSynchronize(nullptr),"complete profiled upload");
+#endif
     double upload=profile_ms(ProfileClock::now()-t0);
     s.prof.mark(0);
     const dim3 grid((p.N+255)/256,p.K);
