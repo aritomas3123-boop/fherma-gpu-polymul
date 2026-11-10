@@ -413,7 +413,11 @@ inline Words reconstruct_one(const HostPlan &p, const u32 *r, std::size_t stride
 namespace fherma_crt {
 // Prime-major input [p][coefficient], coefficient-major canonical output
 // [coefficient][limb]. Threads in a row read neighbouring coefficients.
-constexpr unsigned tile_x = 16;
+#ifndef FHERMA_CRT_TILE_X
+#define FHERMA_CRT_TILE_X 16
+#endif
+static_assert(FHERMA_CRT_TILE_X == 16 || FHERMA_CRT_TILE_X == 32, "CRT tile width must be 16 or 32");
+constexpr unsigned tile_x = FHERMA_CRT_TILE_X;
 constexpr unsigned tile_y = 8;
 
 struct DeviceArgs {
@@ -480,7 +484,15 @@ public:
         cudaError_t status = cudaGetDevice(&device);
         if (status == cudaSuccess) status = cudaGetDeviceProperties(&prop, device);
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
-        if (shared_ > prop.sharedMemPerBlock) throw std::invalid_argument("CRT tile exceeds shared memory capacity");
+        // The 32-wide CRT tile can exceed the CUDA default 48 KiB dynamic-shared limit.
+        // Blackwell supports opt-in shared memory; request it explicitly when needed.
+        if (shared_ > prop.sharedMemPerBlock) {
+            if (shared_ > prop.sharedMemPerBlockOptin)
+                throw std::invalid_argument("CRT tile exceeds opt-in shared memory capacity");
+            status = cudaFuncSetAttribute(reconstruct_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(shared_));
+            if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+        }
         try { upload(args_.primes, plan.primes); upload(args_.weights, plan.weights); upload(args_.q, plan.q); }
         catch (...) { release(); throw; }
     }
