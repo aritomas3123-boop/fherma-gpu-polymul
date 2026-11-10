@@ -30,3 +30,18 @@ Run `node verify-reindex.js`. It compares the old permutation and fused gather a
 References:
 - NVIDIA CUDA Best Practices Guide: https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/
 - Official challenge rules: https://www.fherma.io/kernels/polynomial-multiplication/challenges/polynomial-multiplication-2025?tab=rules
+
+## Feasibility calculations added
+Run `node transfer-feasibility.js` to inspect transfer-volume bounds for both official points. The large point transports two 13.750 MiB input tensors and one 13.750 MiB output tensor, or 41.250 MiB total. At a hypothetical aggregate 64 GB/s, serial transfer of these would consume about 675.8 microseconds before math. Reaching 400 microseconds would need at least 108 GB/s of aggregate I/O absent transfer/computation overlap or other optimizations. This is an **illustrative feasibility estimate, not a tested bound**: GPU transfers may be full-duplex, overlapped, cached, mapped, staged or affected by actual PCIe bottlenecks. Do not infer impossibility from this computation.
+
+### Critical next experiments
+- Capture 20 official-like wall-clock cases and Nsight Systems GPU/CPU timeline. Prioritize end-to-end, copy engines, synchronization and CRT percentages.
+- Compare baseline, profiling-off baseline and fused-reindex variant independently with full verifier.
+- Consider cuPQC NTT at existing 31-bit RNS moduli; NTT library supports custom primes and staged transforms, but porting requires correct Montgomery constants/twiddles and proper negacyclic twists.
+- Do **not** submit or label faster unless it passes the exact FHERMA verifier and measured GPU benchmark.
+
+NVIDIA cuPQC API references:
+https://docs.nvidia.com/cuda/cupqc/index.html
+https://docs.nvidia.com/cuda/cupqc/libraries/cupqc_ntt/cupqc_ntt_usage.html
+Official benchmark details:
+https://www.fherma.io/docs/submit-a-challenge-solution
