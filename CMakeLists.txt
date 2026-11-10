@@ -18,10 +18,12 @@ else()
   option(FHERMA_FUSED_REINDEX "Experiment: fuse bit-reversal input gather into encoding" OFF)
   set(FHERMA_CRT_TILE_X 16 CACHE STRING "CRT coefficients per block, 16 (baseline) or 32 (experiment)")
   option(FHERMA_PROFILE "Enable GPU stage profiling (adds timing overhead)" OFF)
+  option(FHERMA_ALEX_FUSED_CRT "Fuse inverse scaling/untwist and CRT term weighting per GenesisOne proof" ON)
   target_compile_definitions(solution PRIVATE
     FHERMA_NTT_TILED=$<BOOL:${FHERMA_NTT_TILED}>
     FHERMA_FUSED_REINDEX=$<BOOL:${FHERMA_FUSED_REINDEX}>
     FHERMA_PROFILE=$<BOOL:${FHERMA_PROFILE}>
+    FHERMA_ALEX_FUSED_CRT=$<BOOL:${FHERMA_ALEX_FUSED_CRT}>
     FHERMA_CRT_TILE_X=${FHERMA_CRT_TILE_X})
   set_target_properties(solution PROPERTIES CUDA_ARCHITECTURES OFF)
   target_compile_options(solution PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-arch=${FHERMA_CUDA_ARCH}>)
