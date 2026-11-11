@@ -1041,6 +1041,9 @@ public:
 #include <cstdio>
 #include <system_error>
 
+#ifndef FHERMA_STAGE_DIAG
+#define FHERMA_STAGE_DIAG 0
+#endif
 namespace {
 void check(cudaError_t e,const char* where) {
     if(e!=cudaSuccess) throw std::runtime_error(std::string(where)+": "+cudaGetErrorString(e));
@@ -1119,8 +1122,69 @@ __global__ void decode(uint32_t* a,const ari::Prime* primes,const uint32_t* untw
     const size_t at=size_t(k)*N+i;const auto p=primes[k];
     a[at]=ari::mont(ari::mont(a[at],untwist[at],p),1,p);
 }
+#if FHERMA_STAGE_DIAG
+// GPU event timings are DIAGNOSTIC, not leaderboard timings.
+// Events slightly perturb launch scheduling; do not use this build for ranking.
+struct StageDiagnostics {
+    enum E { A_BEGIN, A_H2D, A_ENCODE, A_NTT, B_BEGIN, B_H2D, B_ENCODE, B_NTT,
+             MULTIPLY, INVERSE_NTT, DECODE, CRT, D2H, COUNT };
+    cudaEvent_t e[COUNT]{};
+    std::vector<std::array<double, 12>> history;
+    StageDiagnostics() {
+        try {for(auto &v:e)check(cudaEventCreate(&v),"create timing event");}
+        catch(...){for(auto v:e)if(v)cudaEventDestroy(v);throw;}
+    }
+    ~StageDiagnostics(){for(auto v:e)if(v)cudaEventDestroy(v);}
+    void mark(E index,cudaStream_t stream=nullptr) {
+        check(cudaEventRecord(e[index],stream),"record diagnostic event");
+    }
+    void collect(double hostA,double hostB,double hostOutput,double hostTotal) {
+        // Called only after BOTH streams are synchronized by the normal RunFence.
+        std::array<double,12> row{};
+        const E starts[]={A_BEGIN,A_H2D,A_ENCODE,B_BEGIN,B_H2D,B_ENCODE,
+                          B_NTT,MULTIPLY,INVERSE_NTT,DECODE,CRT};
+        const E ends[]  ={A_H2D,A_ENCODE,A_NTT,B_H2D,B_ENCODE,B_NTT,
+                          MULTIPLY,INVERSE_NTT,DECODE,CRT,D2H};
+        for(unsigned i=0;i<11;i++){
+            float ms=0;
+            check(cudaEventElapsedTime(&ms,e[starts[i]],e[ends[i]]),
+                "read diagnostic interval");
+            row[i]=double(ms);
+        }
+        // The GPU intervals represent A/B H2D, encode, NTT,
+        // (B NTT->pointwise join), pointwise->inverse, inverse->decode,
+        // decode->CRT, and CRT->D2H. They overlap and MUST NOT be summed.
+        row[11]=hostTotal;
+        history.push_back(row);
+        // CPU preparation and output construction (not part of GPU event times).
+        std::fprintf(stderr,
+            "ARI_DIAG_SINGLE host_A_copy_ms=%.5f host_B_copy_ms=%.5f host_output_ms=%.5f wall_ms=%.5f\n",
+            hostA,hostB,hostOutput,hostTotal);
+    }
+    void report(unsigned n,unsigned w) {
+        if(history.empty())return;
+        const char *names[]={"A_H2D","A_encode","A_NTT","B_H2D","B_encode","B_NTT",
+          "B_NTT_to_multiply_join","multiply_to_inverse","inverse_to_decode",
+          "decode_to_CRT","CRT_to_D2H","full_wall"};
+        std::fprintf(stderr,"ARI_DIAG_MEDIAN n=%u w=%u calls=%zu",n,w,history.size());
+        for(unsigned col=0;col<12;col++){
+            std::vector<double> v;v.reserve(history.size());
+            for(const auto &row:history)v.push_back(row[col]);
+            std::sort(v.begin(),v.end());
+            const auto n=v.size();
+            std::fprintf(stderr," %s_ms=%.5f",names[col],
+                         n%2?v[n/2]:(v[n/2-1]+v[n/2])*0.5);
+        }
+        std::fprintf(stderr," NOTE=DIAGNOSTIC_OVERLAPPING_INTERVALS_NOT_ADDITIVE\n");
+        std::fflush(stderr);
+    }
+};
+#endif
 struct State {
     ari::Plan plan;
+#if FHERMA_STAGE_DIAG
+    StageDiagnostics diag;
+#endif
     OperandStream stream_a;
     ForwardReady forward_a;
     Buffer<uint32_t> a,b,c,ra,rb,rc,roots,inverse_roots,twist,untwist;
@@ -1239,22 +1303,42 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     const size_t words=size_t(p.N)*p.L,bytes=words*sizeof(uint32_t);
     if(in.a.data.size()!=words||in.b.data.size()!=words)throw std::runtime_error("input size does not match point");
     RunFence fence(s.stream_a.handle);
+#if FHERMA_STAGE_DIAG
+    using DiagClock=std::chrono::steady_clock;
+    const auto diagBegin=DiagClock::now();
+    double hostCopies[2]{};
+    double hostOutMs=0;
+#endif
     const dim3 grid((p.N+255)/256,p.K);
 #if !FHERMA_NTT_TILED
     const dim3 butterflies((p.N/2+255)/256,p.K);
 #endif
     auto submit_operand=[&](unsigned operand,const uint32_t* input,cudaStream_t stream){
         uint32_t* device=operand?s.b.ptr:s.a.ptr;
+#if FHERMA_STAGE_DIAG
+        const auto hostBegin=DiagClock::now();
+#endif
         uint32_t* residues=operand?s.rb.ptr:s.ra.ptr;
 #if FHERMA_PINNED_INPUT
         uint32_t* stage=operand?s.host_b.ptr:s.host_a.ptr;
         s.copy_team->copy(stage,input,words,s.input_wc);
         input=stage;
 #endif
+#if FHERMA_STAGE_DIAG
+        hostCopies[operand]=std::chrono::duration<double,std::milli>(
+              DiagClock::now()-hostBegin).count();
+        s.diag.mark(operand?StageDiagnostics::B_BEGIN:StageDiagnostics::A_BEGIN,stream);
+#endif
         check(cudaMemcpyAsync(device,input,bytes,cudaMemcpyHostToDevice,stream),"upload operand");
+#if FHERMA_STAGE_DIAG
+        s.diag.mark(operand?StageDiagnostics::B_H2D:StageDiagnostics::A_H2D,stream);
+#endif
         check(ari_wmma_encoder::launch_operand(device,residues,operand,s.packed_inputs.ptr,
             s.packed_weights.ptr,s.primes.ptr,s.radix.ptr,s.twist.ptr,
             p.N,p.L,p.logN,p.K,stream),"encode operand");
+#if FHERMA_STAGE_DIAG
+        s.diag.mark(operand?StageDiagnostics::B_ENCODE:StageDiagnostics::A_ENCODE,stream);
+#endif
 #if FHERMA_NTT_TILED
         // The template selects the number of arrays. The roots select direction.
         check(ari_tile::transform<false>(residues,nullptr,s.primes.ptr,s.roots.ptr,
@@ -1265,6 +1349,9 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
             check(cudaGetLastError(),"single-operand forward stage");
         }
 #endif
+#if FHERMA_STAGE_DIAG
+        s.diag.mark(operand?StageDiagnostics::B_NTT:StageDiagnostics::A_NTT,stream);
+#endif
     };
     submit_operand(0,in.a.data.data(),s.stream_a.handle);
     check(cudaEventRecord(s.forward_a.handle,s.stream_a.handle),"mark A transform complete");
@@ -1273,6 +1360,9 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     check(cudaStreamWaitEvent(nullptr,s.forward_a.handle,0),"join A and B before product");
     multiply_reverse<<<grid,256>>>(s.ra.ptr,s.rb.ptr,s.rc.ptr,s.primes.ptr,p.N,p.logN);
     check(cudaGetLastError(),"multiply launch");
+#if FHERMA_STAGE_DIAG
+    s.diag.mark(StageDiagnostics::MULTIPLY);
+#endif
 #if FHERMA_NTT_TILED
     check(ari_tile::transform<false>(s.rc.ptr,nullptr,s.primes.ptr,s.inverse_roots.ptr,p.N,p.K),"tiled inverse NTT");
 #else
@@ -1281,21 +1371,51 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
         check(cudaGetLastError(),"inverse NTT launch");
     }
 #endif
+#if FHERMA_STAGE_DIAG
+    s.diag.mark(StageDiagnostics::INVERSE_NTT);
+#endif
     decode<<<grid,256>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
     check(cudaGetLastError(),"decode launch");
+#if FHERMA_STAGE_DIAG
+    s.diag.mark(StageDiagnostics::DECODE);
+#endif
     check(s.crt->run(s.rc.ptr,s.c.ptr),"CRT launch");
+#if FHERMA_STAGE_DIAG
+    s.diag.mark(StageDiagnostics::CRT);
+#endif
     fherma::Outputs out;out.c.shape={int64_t(p.N),int64_t(p.L)};
 #if FHERMA_PINNED_OUTPUT
     check(cudaMemcpyAsync(s.host_c.ptr,s.c.ptr,bytes,cudaMemcpyDeviceToHost,nullptr),"download staged result");
+#if FHERMA_STAGE_DIAG
+    s.diag.mark(StageDiagnostics::D2H);
+    const auto hostOutputBegin=DiagClock::now();
+#endif
     // Construct elements while D2H and preceding kernels can still run.
     out.c.data.resize(words);
     fence.complete();
     s.copy_team->copy(out.c.data.data(),s.host_c.ptr,words);
+#if FHERMA_STAGE_DIAG
+    hostOutMs=std::chrono::duration<double,std::milli>(DiagClock::now()-hostOutputBegin).count();
+#endif
 #else
     out.c.data.resize(words);
     check(cudaMemcpy(out.c.data.data(),s.c.ptr,bytes,cudaMemcpyDeviceToHost),"download result");
+#if FHERMA_STAGE_DIAG
+    s.diag.mark(StageDiagnostics::D2H);
+#endif
     fence.complete();
+#endif
+#if FHERMA_STAGE_DIAG
+    // Ensure the non-pinned path's D2H completion event is ready before reading it.
+    check(cudaEventSynchronize(s.diag.e[StageDiagnostics::D2H]),"complete diagnostic D2H event");
+    s.diag.collect(hostCopies[0],hostCopies[1],hostOutMs,
+      std::chrono::duration<double,std::milli>(DiagClock::now()-diagBegin).count());
 #endif
     return out;
 }
-void fherma_free(void* state) {delete static_cast<State*>(state);}
+void fherma_free(void* state) {
+#if FHERMA_STAGE_DIAG
+    if(state){auto *s=static_cast<State*>(state);s->diag.report(s->plan.N,s->plan.W);}
+#endif
+    delete static_cast<State*>(state);
+}
