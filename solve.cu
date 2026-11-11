@@ -1138,11 +1138,21 @@ struct BatchDownload {
     Buffer<uint32_t> second_device;
     HostBuffer<uint32_t> second_host;
     OperandStream stream;
-    ForwardReady upload_a, upload_b, computed, downloaded[2];
+    // A second pair of pinned input buffers lets the host prepare the next
+    // multiplication while DMA is still reading the previous pair.
+    // Events are per slot: a slot is not rewritten until its H2D copies finish.
+#if FHERMA_PINNED_INPUT
+    HostBuffer<uint32_t> second_input_a, second_input_b;
+#endif
+    ForwardReady upload_a[2], upload_b[2], computed, downloaded[2];
 
     explicit BatchDownload(size_t words) {
         second_device.alloc(words);
         second_host.alloc(words);
+#if FHERMA_PINNED_INPUT
+        second_input_a.alloc(words);
+        second_input_b.alloc(words);
+#endif
     }
 };
 
@@ -1263,7 +1273,7 @@ void* fherma_init(const fherma::Point& p) {
 }
 
 static void enqueue_pair(State& s, const uint32_t* a, const uint32_t* b,
-                         uint32_t* device_output, BatchDownload* batch) {
+                         uint32_t* device_output, BatchDownload* batch, unsigned input_slot = 0) {
     const auto& p=s.plan;
     const size_t words=size_t(p.N)*p.L,bytes=words*sizeof(uint32_t);
     const dim3 grid((p.N+255)/256,p.K);
@@ -1275,12 +1285,15 @@ static void enqueue_pair(State& s, const uint32_t* a, const uint32_t* b,
         uint32_t* residues=operand?s.rb.ptr:s.ra.ptr;
 #if FHERMA_PINNED_INPUT
         uint32_t* stage=operand?s.host_b.ptr:s.host_a.ptr;
+        if (batch && input_slot) {
+            stage=operand?batch->second_input_b.ptr:batch->second_input_a.ptr;
+        }
         s.copy_team->copy(stage,input,words,s.input_wc);
         input=stage;
 #endif
         check(cudaMemcpyAsync(device,input,bytes,cudaMemcpyHostToDevice,stream),"upload operand");
         if (batch) {
-            auto upload = operand ? batch->upload_b.handle : batch->upload_a.handle;
+            auto upload = operand ? batch->upload_b[input_slot].handle : batch->upload_a[input_slot].handle;
             check(cudaEventRecord(upload, stream), "record input upload");
         }
         check(ari_wmma_encoder::launch_operand(device,residues,operand,s.packed_inputs.ptr,
@@ -1365,11 +1378,16 @@ static void multiply_batch(State& s, const uint32_t* a, const uint32_t* b,
             // A uses a nonblocking stream and must wait before reusing scratch.
             check(cudaStreamWaitEvent(s.stream_a.handle, batch.computed.handle, 0),
                   "wait before reusing A scratch");
-            // Only the upload DMA must finish before the CPU rewrites staging.
-            check(cudaEventSynchronize(batch.upload_a.handle), "wait before staging A");
-            check(cudaEventSynchronize(batch.upload_b.handle), "wait before staging B");
         }
-        enqueue_pair(s, a + index * words, b + index * words, device_slots[slot], &batch);
+        if (index >= 2) {
+            // The DMA for this input slot must finish before the CPU overwrites
+            // the corresponding pinned staging buffers. We do not need to wait
+            // for the immediately preceding pair: it uses the other slot.
+            check(cudaEventSynchronize(batch.upload_a[slot].handle), "wait to reuse staged A");
+            check(cudaEventSynchronize(batch.upload_b[slot].handle), "wait to reuse staged B");
+        }
+        enqueue_pair(s, a + index * words, b + index * words, device_slots[slot], &batch,
+                     static_cast<unsigned>(slot));
         check(cudaEventRecord(batch.computed.handle, nullptr), "record completed CRT");
         check(cudaStreamWaitEvent(download, batch.computed.handle, 0), "wait for CRT on download stream");
         check(cudaMemcpyAsync(host_slots[slot], device_slots[slot], bytes,
