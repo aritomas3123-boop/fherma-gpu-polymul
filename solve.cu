@@ -1119,11 +1119,60 @@ __global__ void decode(uint32_t* a,const ari::Prime* primes,const uint32_t* untw
     const size_t at=size_t(k)*N+i;const auto p=primes[k];
     a[at]=ari::mont(ari::mont(a[at],untwist[at],p),1,p);
 }
+using BatchClock = std::chrono::steady_clock;
+
+struct BatchSample {
+    cudaEvent_t event[3]{};
+    BatchSample() {
+        try {
+            for (auto& e : event) check(cudaEventCreate(&e), "create diagnostic event");
+        } catch (...) {
+            for (auto e : event) if (e) cudaEventDestroy(e);
+            throw;
+        }
+    }
+    ~BatchSample() { for (auto e : event) cudaEventDestroy(e); }
+    BatchSample(const BatchSample&) = delete;
+    void mark(unsigned index) const {
+        check(cudaEventRecord(event[index], nullptr), "record batch diagnostic event");
+    }
+    float elapsed(unsigned start) const {
+        float value = 0;
+        check(cudaEventElapsedTime(&value, event[start], event[start + 1]), "read batch diagnostic event");
+        return value;
+    }
+};
+
+struct BatchDiagnostic {
+    double stage = 0, upload_wait = 0, download_wait = 0, output_copy = 0;
+    std::array<BatchSample, 16> samples;
+    size_t count = 0;
+
+    static double ms(BatchClock::time_point start) {
+        return std::chrono::duration<double, std::milli>(BatchClock::now() - start).count();
+    }
+
+    void report(size_t size, double allocate) const {
+        double transform = 0, crt = 0;
+        for (size_t i = 0; i < count; ++i) {
+            transform += samples[i].elapsed(0);
+            crt += samples[i].elapsed(1);
+        }
+        std::fprintf(stderr,
+            "BATCH_DIAG B=%zu alloc_ms=%.3f stage_ms=%.3f upload_wait_ms=%.3f "
+            "download_wait_ms=%.3f output_copy_ms=%.3f gpu_samples=%zu post_fwd_ms_avg=%.4f crt_ms_avg=%.4f\n",
+            size, allocate, stage, upload_wait, download_wait, output_copy, count,
+            transform / count, crt / count);
+        std::fflush(stderr);
+    }
+};
+
 struct BatchDownload {
     Buffer<uint32_t> second_device;
     HostBuffer<uint32_t> second_host;
     OperandStream stream;
     ForwardReady upload_a, upload_b, computed, downloaded[2];
+    BatchDiagnostic diagnostics;
 
     explicit BatchDownload(size_t words) {
         second_device.alloc(words);
@@ -1248,7 +1297,7 @@ void* fherma_init(const fherma::Point& p) {
 }
 
 static void enqueue_pair(State& s, const uint32_t* a, const uint32_t* b,
-                         uint32_t* device_output, BatchDownload* batch) {
+                         uint32_t* device_output, BatchDownload* batch, BatchSample* sample = nullptr) {
     const auto& p=s.plan;
     const size_t words=size_t(p.N)*p.L,bytes=words*sizeof(uint32_t);
     const dim3 grid((p.N+255)/256,p.K);
@@ -1260,7 +1309,9 @@ static void enqueue_pair(State& s, const uint32_t* a, const uint32_t* b,
         uint32_t* residues=operand?s.rb.ptr:s.ra.ptr;
 #if FHERMA_PINNED_INPUT
         uint32_t* stage=operand?s.host_b.ptr:s.host_a.ptr;
+        const auto stage_start = BatchClock::now();
         s.copy_team->copy(stage,input,words,s.input_wc);
+        if (batch) batch->diagnostics.stage += BatchDiagnostic::ms(stage_start);
         input=stage;
 #endif
         check(cudaMemcpyAsync(device,input,bytes,cudaMemcpyHostToDevice,stream),"upload operand");
@@ -1287,6 +1338,7 @@ static void enqueue_pair(State& s, const uint32_t* a, const uint32_t* b,
     // This CPU staging copy and the B upload may overlap A's encoder/NTT.
     submit_operand(1,b,nullptr);
     check(cudaStreamWaitEvent(nullptr,s.forward_a.handle,0),"join A and B before product");
+    if (sample) sample->mark(0);
     multiply_reverse<<<grid,256>>>(s.ra.ptr,s.rb.ptr,s.rc.ptr,s.primes.ptr,p.N,p.logN);
     check(cudaGetLastError(),"multiply launch");
 #if FHERMA_NTT_TILED
@@ -1299,7 +1351,9 @@ static void enqueue_pair(State& s, const uint32_t* a, const uint32_t* b,
 #endif
     decode<<<grid,256>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
     check(cudaGetLastError(),"decode launch");
+    if (sample) sample->mark(1);
     check(s.crt->run(s.rc.ptr,device_output),"CRT launch");
+    if (sample) sample->mark(2);
 }
 
 static void multiply_pair(State& s, const uint32_t* a, const uint32_t* b,
@@ -1327,11 +1381,15 @@ struct BatchFence {
 };
 
 static void multiply_batch(State& s, const uint32_t* a, const uint32_t* b,
-                           uint32_t* output, size_t batch_size, size_t words) {
+                           uint32_t* output, size_t batch_size, size_t words, double allocate_ms) {
     if (!s.batch_download)
         s.batch_download = std::make_unique<BatchDownload>(words);
     auto& batch = *s.batch_download;
     const auto download = batch.stream.handle;
+    auto& diag = batch.diagnostics;
+    diag.stage = diag.upload_wait = diag.download_wait = diag.output_copy = 0;
+    diag.count = 0;
+    const auto stride = std::max(size_t(1), batch_size / diag.samples.size());
     BatchFence fence{s.stream_a.handle, download};
     uint32_t* const device_slots[] = {s.c.ptr, batch.second_device.ptr};
     uint32_t* const host_slots[] = {s.host_c.ptr, batch.second_host.ptr};
@@ -1339,8 +1397,12 @@ static void multiply_batch(State& s, const uint32_t* a, const uint32_t* b,
 
     auto consume = [&](size_t index) {
         const auto slot = index % 2;
+        const auto wait = BatchClock::now();
         check(cudaEventSynchronize(batch.downloaded[slot].handle), "wait for output slot");
+        diag.download_wait += BatchDiagnostic::ms(wait);
+        const auto copy = BatchClock::now();
         s.copy_team->copy(output + index * words, host_slots[slot], words);
+        diag.output_copy += BatchDiagnostic::ms(copy);
     };
 
     for (size_t index = 0; index < batch_size; ++index) {
@@ -1352,10 +1414,15 @@ static void multiply_batch(State& s, const uint32_t* a, const uint32_t* b,
             check(cudaStreamWaitEvent(s.stream_a.handle, batch.computed.handle, 0),
                   "wait before reusing A scratch");
             // Only the upload DMA must finish before the CPU rewrites staging.
+            const auto wait = BatchClock::now();
             check(cudaEventSynchronize(batch.upload_a.handle), "wait before staging A");
             check(cudaEventSynchronize(batch.upload_b.handle), "wait before staging B");
+            diag.upload_wait += BatchDiagnostic::ms(wait);
         }
-        enqueue_pair(s, a + index * words, b + index * words, device_slots[slot], &batch);
+        BatchSample* sample = nullptr;
+        if (index % stride == 0 && diag.count < diag.samples.size())
+            sample = &diag.samples[diag.count++];
+        enqueue_pair(s, a + index * words, b + index * words, device_slots[slot], &batch, sample);
         check(cudaEventRecord(batch.computed.handle, nullptr), "record completed CRT");
         check(cudaStreamWaitEvent(download, batch.computed.handle, 0), "wait for CRT on download stream");
         check(cudaMemcpyAsync(host_slots[slot], device_slots[slot], bytes,
@@ -1368,6 +1435,7 @@ static void multiply_batch(State& s, const uint32_t* a, const uint32_t* b,
     check(cudaStreamSynchronize(nullptr), "check batch compute completion");
     check(cudaStreamSynchronize(download), "check batch download completion");
     fence.complete = true;
+    diag.report(batch_size, allocate_ms);
 }
 
 fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
@@ -1389,11 +1457,13 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
 
     fherma::Outputs out;
     out.c.shape = shape;
+    const auto allocate_start = BatchClock::now();
     out.c.data.resize(in.a.data.size());
+    const auto allocate_ms = BatchDiagnostic::ms(allocate_start);
     if (batch == 1)
         multiply_pair(s, in.a.data.data(), in.b.data.data(), out.c.data.data(), words);
     else
-        multiply_batch(s, in.a.data.data(), in.b.data.data(), out.c.data.data(), batch, words);
+        multiply_batch(s, in.a.data.data(), in.b.data.data(), out.c.data.data(), batch, words, allocate_ms);
     return out;
 }
 void fherma_free(void* state) {delete static_cast<State*>(state);}
