@@ -1,0 +1,16 @@
+name: Exact Tensor CRT algebraic candidate proof
+on:
+  push:
+    branches: [experiment-exact-tensor-crt-20261111]
+  workflow_dispatch:
+jobs:
+  validate-exact-algebra:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Execute exact big-integer CRT versus INT8 decomposition
+        run: node research/exact_tensor_crt_gemm_proof.js
