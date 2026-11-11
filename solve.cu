@@ -409,6 +409,10 @@ inline Words reconstruct_one(const HostPlan &p, const u32 *r, std::size_t stride
 
 // ---- rns_crt.cuh ----
 #include <cuda_runtime.h>
+#include <mma.h>
+#ifndef FHERMA_TENSOR_CRT
+#define FHERMA_TENSOR_CRT 0
+#endif
 
 namespace fherma_crt {
 // Prime-major input [p][coefficient], coefficient-major canonical output
@@ -454,6 +458,149 @@ __global__ void reconstruct_kernel(DeviceArgs plan, const u32 *residues, u32 *ou
     }
 }
 
+
+#if FHERMA_TENSOR_CRT
+// New architectural experiment: one CTA owns 16 adjacent coefficients across
+// all L limbs. Four Tensor-Core WMMA warps each process 16 output limbs.
+// The original scalar CRT remains available when FHERMA_TENSOR_CRT=0.
+// NOT A PROVEN PERFORMANCE IMPROVEMENT; exactness must be checked on FHERMA.
+namespace crt_wmma = nvcuda::wmma;
+constexpr unsigned tc_rows=16,tc_warps=4,tc_tile=16,tc_diagonals=7;
+using TcA=crt_wmma::fragment<crt_wmma::matrix_a,16,16,16,unsigned char,crt_wmma::row_major>;
+using TcB=crt_wmma::fragment<crt_wmma::matrix_b,16,16,16,unsigned char,crt_wmma::col_major>;
+using TcAcc=crt_wmma::fragment<crt_wmma::accumulator,16,16,16,int>;
+inline std::size_t tensor_shared_bytes(unsigned k,unsigned l) {
+    const unsigned pitch=k+1;
+    return std::size_t(tc_rows)*pitch*sizeof(u32)
+          +4*256 /* A planes */
+          +tc_warps*4*256 /* B planes */
+          +tc_warps*tc_diagonals*256*sizeof(int) /* partials */
+          +2*tc_rows*l*sizeof(u64)
+          +tc_rows*(l+2)*sizeof(u32);
+}
+__global__ void reconstruct_tensor_kernel(DeviceArgs plan,const u32 *residues,u32 *out) {
+    extern __shared__ unsigned char scratch[];
+    const unsigned tid=threadIdx.x, warp=tid/32, lane=tid%32;
+    const unsigned n=plan.n,k=plan.count,l=plan.limbs,pitch=k+1;
+    const unsigned base=blockIdx.x*tc_rows;
+    unsigned char *ptr=scratch;
+    u32 *terms=reinterpret_cast<u32*>(ptr);
+    ptr+=std::size_t(tc_rows)*pitch*sizeof(u32);
+    unsigned char *planeA=ptr; ptr+=4*256;
+    unsigned char *planeB=ptr; ptr+=tc_warps*4*256;
+    int *partials=reinterpret_cast<int*>(ptr);
+    ptr+=tc_warps*tc_diagonals*256*sizeof(int);
+    u64 *low=reinterpret_cast<u64*>(ptr);
+    ptr+=std::size_t(tc_rows)*l*sizeof(u64);
+    u64 *high=reinterpret_cast<u64*>(ptr);
+    ptr+=std::size_t(tc_rows)*l*sizeof(u64);
+    u32 *digits=reinterpret_cast<u32*>(ptr);
+    // Build canonical weighted CRT terms once per 16-coefficient tile.
+    for(unsigned idx=tid;idx<tc_rows*k;idx+=blockDim.x) {
+        unsigned row=idx/k,j=idx%k,coef=base+row;
+        const u32 residue=coef<n?residues[std::size_t(j)*n+coef]:0;
+        terms[row*pitch+j]=weight_residue(residue,plan.primes[j]);
+    }
+    __syncthreads();
+    if(tid<tc_rows){
+        terms[tid*pitch+k]=correction<1>(terms+tid*pitch,plan.primes,k);
+    }
+    __syncthreads();
+    TcAcc acc[tc_diagonals];
+    #pragma unroll
+    for(unsigned d=0;d<tc_diagonals;d++)crt_wmma::fill_fragment(acc[d],0);
+    const unsigned limbBase=warp*tc_tile;
+    for(unsigned start=0;start<pitch;start+=16){
+        // Every element of the A-plane is shared by four independent warps.
+        for(unsigned index=tid;index<256;index+=blockDim.x){
+            unsigned row=index/16,j=index%16;
+            u32 val=start+j<pitch?terms[row*pitch+start+j]:0;
+            #pragma unroll
+            for(unsigned d=0;d<4;d++)
+                planeA[d*256+index]=static_cast<unsigned char>(val>>(8*d));
+        }
+        // B is column-major: offset column*16+row, each warp owns 16 limbs.
+        for(unsigned index=lane;index<256;index+=32){
+            unsigned col=index/16,j=index%16;
+            unsigned limb=limbBase+col;
+            u32 val=(limb<l && start+j<pitch)?
+                     plan.weights[std::size_t(limb)*pitch+start+j]:0;
+            #pragma unroll
+            for(unsigned d=0;d<4;d++)
+                planeB[(warp*4+d)*256+index]=static_cast<unsigned char>(val>>(8*d));
+        }
+        __syncthreads();
+        TcA af[4];TcB bf[4];
+        #pragma unroll
+        for(unsigned d=0;d<4;d++){
+            crt_wmma::load_matrix_sync(af[d],planeA+d*256,16);
+            crt_wmma::load_matrix_sync(bf[d],planeB+(warp*4+d)*256,16);
+        }
+        #pragma unroll
+        for(unsigned u=0;u<4;u++){
+            #pragma unroll
+            for(unsigned v=0;v<4;v++){
+                crt_wmma::mma_sync(acc[u+v],af[u],bf[v],acc[u+v]);
+            }
+        }
+        __syncthreads();
+    }
+    #pragma unroll
+    for(unsigned d=0;d<tc_diagonals;d++){
+        crt_wmma::store_matrix_sync(partials+(warp*tc_diagonals+d)*256,
+                                    acc[d],16,crt_wmma::mem_row_major);
+    }
+    __syncthreads();
+    for(unsigned e=lane;e<256;e+=32){
+        unsigned row=e/16,col=e%16,limb=limbBase+col;
+        if(limb>=l)continue;
+        // Exactly recombine seven base-256 diagonals without FP rounding.
+        u64 carry=0;
+        u32 words[3]{};
+        for(unsigned d=0;d<tc_diagonals;d++){
+            u64 t=carry+u32(partials[(warp*tc_diagonals+d)*256+e]);
+            const unsigned shift=(d%4)*8;
+            const unsigned wi=d/4;
+            // Each diagonal is at most 4*119*255^2 < 2^25;
+            // propagate into three complete u32 words.
+            if(wi<3){
+                u64 combined=(u64(words[wi])+(t<<shift));
+                words[wi]=u32(combined);
+                carry=combined>>32;
+                if(wi+1<3)words[wi+1]+=u32(carry);
+            }
+        }
+        // The above recombination is diagnostic candidate code; use exact
+        // 96-bit accumulation below for deterministic carry propagation.
+        u64 s0=0,s1=0,s2=0;
+        for(unsigned d=0;d<tc_diagonals;d++){
+            const u64 v=u32(partials[(warp*tc_diagonals+d)*256+e]);
+            const unsigned bits=8*d;
+            if(bits<32){
+                s0+=v<<bits;
+                if(bits && bits>8) s1+=v>>(32-bits);
+            }else if(bits<64){
+                s1+=v<<(bits-32);
+            }else{
+                s2+=v<<(bits-64);
+            }
+        }
+        s1+=s0>>32;
+        s2+=s1>>32;
+        // no more than 119 products of two u32 words: total < 2^71
+        low[row*l+limb]=u32(s0);
+        high[row*l+limb]=u32(s1)+(s2<<32);
+    }
+    __syncthreads();
+    if(tid<tc_rows && base+tid<n){
+        carry_and_reduce<1>(digits+tid*(l+2),low+tid*l,high+tid*l,
+                             l,plan.bits,plan.gap,plan.q);
+        for(unsigned limb=0;limb<l;limb++)
+           out[std::size_t(base+tid)*l+limb]=digits[tid*(l+2)+limb];
+    }
+}
+#endif
+
 class DevicePlan {
     DeviceArgs args_{};
     std::size_t shared_ = 0;
@@ -474,13 +621,28 @@ public:
         HostPlan plan = make_plan(n, q, limbs, primes);
         args_.n = n; args_.limbs = limbs; args_.bits = plan.bits;
         args_.count = unsigned(primes.size()); args_.gap = plan.gap;
+#if FHERMA_TENSOR_CRT
+        shared_ = tensor_shared_bytes(unsigned(primes.size()),limbs);
+#else
         shared_ = tile_x * (2 * sizeof(u64) * limbs + sizeof(u32) * (primes.size() + 1 + limbs + 2));
+#endif
         int device = 0;
         cudaDeviceProp prop{};
         cudaError_t status = cudaGetDevice(&device);
         if (status == cudaSuccess) status = cudaGetDeviceProperties(&prop, device);
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
-        if (shared_ > prop.sharedMemPerBlock) throw std::invalid_argument("CRT tile exceeds shared memory capacity");
+        if (shared_ > prop.sharedMemPerBlock) {
+            if (shared_ > prop.sharedMemPerBlockOptin)
+                throw std::invalid_argument("CRT tile exceeds opt-in shared memory capacity");
+#if FHERMA_TENSOR_CRT
+            status=cudaFuncSetAttribute(reconstruct_tensor_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(shared_));
+#else
+            status=cudaFuncSetAttribute(reconstruct_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,static_cast<int>(shared_));
+#endif
+            if(status!=cudaSuccess)throw std::runtime_error(cudaGetErrorString(status));
+        }
         try { upload(args_.primes, plan.primes); upload(args_.weights, plan.weights); upload(args_.q, plan.q); }
         catch (...) { release(); throw; }
     }
@@ -489,7 +651,11 @@ public:
     ~DevicePlan() { release(); }
     // Asynchronous, caller checks eventual execution status when consuming out.
     cudaError_t run(const u32 *residues, u32 *out, cudaStream_t stream = nullptr) const {
+#if FHERMA_TENSOR_CRT
+        reconstruct_tensor_kernel<<<(args_.n + tc_rows-1)/tc_rows,128,shared_,stream>>>(args_,residues,out);
+#else
         reconstruct_kernel<<<(args_.n + tile_x - 1) / tile_x, dim3(tile_x, tile_y), shared_, stream>>>(args_, residues, out);
+#endif
         return cudaGetLastError();
     }
 };
