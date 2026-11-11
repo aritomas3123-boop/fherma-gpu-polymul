@@ -1327,7 +1327,7 @@ struct BatchFence {
 };
 
 static void multiply_batch(State& s, const uint32_t* a, const uint32_t* b,
-                           uint32_t* output, size_t batch_size, size_t words) {
+                           std::vector<uint32_t>& output, size_t batch_size, size_t words) {
     if (!s.batch_download)
         s.batch_download = std::make_unique<BatchDownload>(words);
     auto& batch = *s.batch_download;
@@ -1340,7 +1340,8 @@ static void multiply_batch(State& s, const uint32_t* a, const uint32_t* b,
     auto consume = [&](size_t index) {
         const auto slot = index % 2;
         check(cudaEventSynchronize(batch.downloaded[slot].handle), "wait for output slot");
-        s.copy_team->copy(output + index * words, host_slots[slot], words);
+        // Construct the result words from staging instead of zeroing them first.
+        output.insert(output.end(), host_slots[slot], host_slots[slot] + words);
     };
 
     for (size_t index = 0; index < batch_size; ++index) {
@@ -1389,11 +1390,13 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
 
     fherma::Outputs out;
     out.c.shape = shape;
-    out.c.data.resize(in.a.data.size());
-    if (batch == 1)
+    if (batch == 1) {
+        out.c.data.resize(words);
         multiply_pair(s, in.a.data.data(), in.b.data.data(), out.c.data.data(), words);
-    else
-        multiply_batch(s, in.a.data.data(), in.b.data.data(), out.c.data.data(), batch, words);
+    } else {
+        out.c.data.reserve(in.a.data.size());
+        multiply_batch(s, in.a.data.data(), in.b.data.data(), out.c.data, batch, words);
+    }
     return out;
 }
 void fherma_free(void* state) {delete static_cast<State*>(state);}
