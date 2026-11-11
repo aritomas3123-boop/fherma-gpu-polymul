@@ -554,42 +554,22 @@ __global__ void reconstruct_tensor_kernel(DeviceArgs plan,const u32 *residues,u3
     for(unsigned e=lane;e<256;e+=32){
         unsigned row=e/16,col=e%16,limb=limbBase+col;
         if(limb>=l)continue;
-        // Exactly recombine seven base-256 diagonals without FP rounding.
+        // Compute exact base-256 carry propagation for the 7 diagonals:
+        // D[d] = sum over primes and all byte-pairs whose indices sum to d.
+        // S = sum_{d=0..6} D[d] * 2^(8*d), with S < 2^71.
         u64 carry=0;
         u32 words[3]{};
         for(unsigned d=0;d<tc_diagonals;d++){
-            u64 t=carry+u32(partials[(warp*tc_diagonals+d)*256+e]);
-            const unsigned shift=(d%4)*8;
-            const unsigned wi=d/4;
-            // Each diagonal is at most 4*119*255^2 < 2^25;
-            // propagate into three complete u32 words.
-            if(wi<3){
-                u64 combined=(u64(words[wi])+(t<<shift));
-                words[wi]=u32(combined);
-                carry=combined>>32;
-                if(wi+1<3)words[wi+1]+=u32(carry);
-            }
+            carry+=u32(partials[(warp*tc_diagonals+d)*256+e]);
+            const u32 oneByte=u32(carry)&255u;
+            words[d/4] |= oneByte << (8*(d%4));
+            carry >>= 8;
         }
-        // The above recombination is diagnostic candidate code; use exact
-        // 96-bit accumulation below for deterministic carry propagation.
-        u64 s0=0,s1=0,s2=0;
-        for(unsigned d=0;d<tc_diagonals;d++){
-            const u64 v=u32(partials[(warp*tc_diagonals+d)*256+e]);
-            const unsigned bits=8*d;
-            if(bits<32){
-                s0+=v<<bits;
-                if(bits && bits>8) s1+=v>>(32-bits);
-            }else if(bits<64){
-                s1+=v<<(bits-32);
-            }else{
-                s2+=v<<(bits-64);
-            }
-        }
-        s1+=s0>>32;
-        s2+=s1>>32;
-        // no more than 119 products of two u32 words: total < 2^71
-        low[row*l+limb]=u32(s0);
-        high[row*l+limb]=u32(s1)+(s2<<32);
+        // Process byte #7 and all remaining carry bits without overflow.
+        words[1] |= (u32(carry)&255u)<<24;
+        words[2] = u32(carry>>8);
+        low[row*l+limb]=words[0];
+        high[row*l+limb]=u64(words[1])+(u64(words[2])<<32);
     }
     __syncthreads();
     if(tid<tc_rows && base+tid<n){
