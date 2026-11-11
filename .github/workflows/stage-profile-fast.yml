@@ -1,0 +1,26 @@
+name: Compile original-fast-baseline GPU stage diagnostics
+on:
+  push:
+    branches: [research-profile-fast-baseline-20261111]
+  workflow_dispatch:
+jobs:
+  cuda:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [ON, OFF]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compilers
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cmake make g++
+      - name: Compile CUDA Blackwell sm_120 with diagnostic mode
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFHERMA_CUDA_ARCH=sm_120 -DFHERMA_STAGE_DIAG=${{ matrix.profile }}
+          cmake --build build -j 2
+          ls -lh build/solution
