@@ -1234,10 +1234,9 @@ void* fherma_init(const fherma::Point& p) {
     return s.release();
 }
 
-fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
-    auto& s=*static_cast<State*>(state);const auto& p=s.plan;
+static void multiply_pair(State& s, const uint32_t* a, const uint32_t* b, uint32_t* output) {
+    const auto& p=s.plan;
     const size_t words=size_t(p.N)*p.L,bytes=words*sizeof(uint32_t);
-    if(in.a.data.size()!=words||in.b.data.size()!=words)throw std::runtime_error("input size does not match point");
     RunFence fence(s.stream_a.handle);
     const dim3 grid((p.N+255)/256,p.K);
 #if !FHERMA_NTT_TILED
@@ -1266,10 +1265,10 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
         }
 #endif
     };
-    submit_operand(0,in.a.data.data(),s.stream_a.handle);
+    submit_operand(0,a,s.stream_a.handle);
     check(cudaEventRecord(s.forward_a.handle,s.stream_a.handle),"mark A transform complete");
     // This CPU staging copy and the B upload may overlap A's encoder/NTT.
-    submit_operand(1,in.b.data.data(),nullptr);
+    submit_operand(1,b,nullptr);
     check(cudaStreamWaitEvent(nullptr,s.forward_a.handle,0),"join A and B before product");
     multiply_reverse<<<grid,256>>>(s.ra.ptr,s.rb.ptr,s.rc.ptr,s.primes.ptr,p.N,p.logN);
     check(cudaGetLastError(),"multiply launch");
@@ -1284,18 +1283,39 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
     decode<<<grid,256>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
     check(cudaGetLastError(),"decode launch");
     check(s.crt->run(s.rc.ptr,s.c.ptr),"CRT launch");
-    fherma::Outputs out;out.c.shape={int64_t(p.N),int64_t(p.L)};
 #if FHERMA_PINNED_OUTPUT
     check(cudaMemcpyAsync(s.host_c.ptr,s.c.ptr,bytes,cudaMemcpyDeviceToHost,nullptr),"download staged result");
-    // Construct elements while D2H and preceding kernels can still run.
-    out.c.data.resize(words);
     fence.complete();
-    s.copy_team->copy(out.c.data.data(),s.host_c.ptr,words);
+    s.copy_team->copy(output,s.host_c.ptr,words);
 #else
-    out.c.data.resize(words);
-    check(cudaMemcpy(out.c.data.data(),s.c.ptr,bytes,cudaMemcpyDeviceToHost),"download result");
+    check(cudaMemcpy(output,s.c.ptr,bytes,cudaMemcpyDeviceToHost),"download result");
     fence.complete();
 #endif
+}
+
+fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
+    auto& s = *static_cast<State*>(state);
+    const auto& p = s.plan;
+    const std::vector<int64_t> pair_shape{int64_t(p.N), int64_t(p.L)};
+    const auto& shape = in.a.shape;
+    const bool single = shape == pair_shape;
+    if (shape != in.b.shape ||
+        (!single && (shape.size() != 3 || shape[0] <= 0 ||
+                     shape[1] != pair_shape[0] || shape[2] != pair_shape[1])))
+        throw std::invalid_argument("expected matching [B,N,L] or [N,L] inputs");
+
+    const size_t words = size_t(p.N) * p.L;
+    const size_t batch = single ? 1 : size_t(shape[0]);
+    if (!words || in.a.data.size() % words || in.a.data.size() / words != batch ||
+        in.b.data.size() != in.a.data.size())
+        throw std::invalid_argument("input storage does not match the batch shape");
+
+    fherma::Outputs out;
+    out.c.shape = shape;
+    out.c.data.resize(in.a.data.size());
+    for (size_t offset = 0; offset < out.c.data.size(); offset += words)
+        multiply_pair(s, in.a.data.data() + offset, in.b.data.data() + offset,
+                      out.c.data.data() + offset);
     return out;
 }
 void fherma_free(void* state) {delete static_cast<State*>(state);}
