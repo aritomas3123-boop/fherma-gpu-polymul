@@ -420,9 +420,10 @@ struct DeviceArgs {
     unsigned n, limbs, bits, count;
     u32 gap;
     PrimeInfo *primes;
-    u32 *weights, *q;
+    u32 *weights, *q, *weighted_untwist;
 };
-__global__ void reconstruct_kernel(DeviceArgs plan, const u32 *residues, u32 *out) {
+__global__ void reconstruct_kernel(DeviceArgs plan, const u32 *residues,
+                                   const ari::Prime* primes, u32 *out) {
     extern __shared__ unsigned long long shared[];
     unsigned x = threadIdx.x, y = threadIdx.y;
     unsigned coef = blockIdx.x * tile_x + x;
@@ -433,8 +434,12 @@ __global__ void reconstruct_kernel(DeviceArgs plan, const u32 *residues, u32 *ou
     u32 *digits = terms + pitch * tile_x;
     bool active = coef < plan.n;
     for (unsigned j = y; j < k; j += tile_y) {
-        u32 r = active ? residues[std::size_t(j) * plan.n + coef] : 0;
-        terms[j * tile_x + x] = weight_residue(r, plan.primes[j]);
+        if (active) {
+            const auto index = std::size_t(j) * plan.n + coef;
+            terms[j * tile_x + x] = ari::mont(residues[index], plan.weighted_untwist[index], primes[j]);
+        } else {
+            terms[j * tile_x + x] = 0;
+        }
     }
     __syncthreads();
     if (y == 0) {
@@ -468,10 +473,20 @@ class DevicePlan {
         if (args_.primes) cudaFree(args_.primes);
         if (args_.weights) cudaFree(args_.weights);
         if (args_.q) cudaFree(args_.q);
+        if (args_.weighted_untwist) cudaFree(args_.weighted_untwist);
     }
 public:
-    DevicePlan(unsigned n, const u32 *q, unsigned limbs, const std::vector<u32>& primes) {
+    DevicePlan(unsigned n, const u32 *q, unsigned limbs, const std::vector<u32>& primes,
+               const std::vector<ari::Prime>& montgomery, const std::vector<u32>& untwist) {
         HostPlan plan = make_plan(n, q, limbs, primes);
+        std::vector<u32> weighted(untwist.size());
+        for (size_t j = 0; j < primes.size(); ++j) {
+            for (size_t i = 0; i < n; ++i) {
+                const size_t index = j * n + i;
+                // (untwist * R) * CRT_inverse / R leaves a normal residue.
+                weighted[index] = ari::mont(untwist[index], plan.primes[j].inv, montgomery[j]);
+            }
+        }
         args_.n = n; args_.limbs = limbs; args_.bits = plan.bits;
         args_.count = unsigned(primes.size()); args_.gap = plan.gap;
         shared_ = tile_x * (2 * sizeof(u64) * limbs + sizeof(u32) * (primes.size() + 1 + limbs + 2));
@@ -481,15 +496,20 @@ public:
         if (status == cudaSuccess) status = cudaGetDeviceProperties(&prop, device);
         if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
         if (shared_ > prop.sharedMemPerBlock) throw std::invalid_argument("CRT tile exceeds shared memory capacity");
-        try { upload(args_.primes, plan.primes); upload(args_.weights, plan.weights); upload(args_.q, plan.q); }
+        try {
+            upload(args_.primes, plan.primes);
+            upload(args_.weights, plan.weights);
+            upload(args_.q, plan.q);
+            upload(args_.weighted_untwist, weighted);
+        }
         catch (...) { release(); throw; }
     }
     DevicePlan(const DevicePlan&) = delete;
     DevicePlan& operator=(const DevicePlan&) = delete;
     ~DevicePlan() { release(); }
     // Asynchronous, caller checks eventual execution status when consuming out.
-    cudaError_t run(const u32 *residues, u32 *out, cudaStream_t stream = nullptr) const {
-        reconstruct_kernel<<<(args_.n + tile_x - 1) / tile_x, dim3(tile_x, tile_y), shared_, stream>>>(args_, residues, out);
+    cudaError_t run(const u32 *residues, const ari::Prime* primes, u32 *out, cudaStream_t stream = nullptr) const {
+        reconstruct_kernel<<<(args_.n + tile_x - 1) / tile_x, dim3(tile_x, tile_y), shared_, stream>>>(args_, residues, primes, out);
         return cudaGetLastError();
     }
 };
@@ -1114,11 +1134,6 @@ __global__ void single_stage(uint32_t* a,const ari::Prime* primes,const uint32_t
     uint32_t x=a[base+i],y=a[base+i+half];ari::butterfly(x,y,w,p);a[base+i]=x;a[base+i+half]=y;
 }
 #endif
-__global__ void decode(uint32_t* a,const ari::Prime* primes,const uint32_t* untwist,unsigned N) {
-    const unsigned i=blockIdx.x*blockDim.x+threadIdx.x,k=blockIdx.y;if(i>=N)return;
-    const size_t at=size_t(k)*N+i;const auto p=primes[k];
-    a[at]=ari::mont(ari::mont(a[at],untwist[at],p),1,p);
-}
 struct BatchDownload {
     Buffer<uint32_t> second_device;
     HostBuffer<uint32_t> second_host;
@@ -1135,7 +1150,7 @@ struct State {
     ari::Plan plan;
     OperandStream stream_a;
     ForwardReady forward_a;
-    Buffer<uint32_t> a,b,c,ra,rb,rc,roots,inverse_roots,twist,untwist;
+    Buffer<uint32_t> a,b,c,ra,rb,rc,roots,inverse_roots,twist;
     Buffer<ari::Prime> primes;
     Buffer<uint8_t> packed_inputs, packed_weights;
     Buffer<ari_shoup::Weight> radix;
@@ -1239,9 +1254,9 @@ void* fherma_init(const fherma::Point& p) {
     s->packed_weights.copy(weights.panels);
     s->radix.copy(weights.radix);
     s->primes.copy(s->plan.primes);s->roots.copy(s->plan.roots);
-    s->inverse_roots.copy(s->plan.inverse_roots);s->twist.copy(ari_shoup::reorder_twists(s->plan.twist,p.N,s->plan.logN));s->untwist.copy(s->plan.untwist);
+    s->inverse_roots.copy(s->plan.inverse_roots);s->twist.copy(ari_shoup::reorder_twists(s->plan.twist,p.N,s->plan.logN));
     std::vector<uint32_t> primes;for(auto prime:s->plan.primes)primes.push_back(prime.p);
-    s->crt=std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes);
+    s->crt=std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes,s->plan.primes,s->plan.untwist);
     check(cudaDeviceSynchronize(),"initialize GPU");
     choose_staging(*s,words);
     return s.release();
@@ -1297,9 +1312,7 @@ static void enqueue_pair(State& s, const uint32_t* a, const uint32_t* b,
         check(cudaGetLastError(),"inverse NTT launch");
     }
 #endif
-    decode<<<grid,256>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
-    check(cudaGetLastError(),"decode launch");
-    check(s.crt->run(s.rc.ptr,device_output),"CRT launch");
+    check(s.crt->run(s.rc.ptr,s.primes.ptr,device_output),"CRT launch");
 }
 
 static void multiply_pair(State& s, const uint32_t* a, const uint32_t* b,
