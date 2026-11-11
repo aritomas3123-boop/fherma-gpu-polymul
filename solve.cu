@@ -1052,6 +1052,144 @@ template<class T> struct Buffer {
     void alloc(size_t n){check(cudaMalloc(reinterpret_cast<void**>(&ptr),n*sizeof(T)),"cudaMalloc");}
     void copy(const std::vector<T>& x){alloc(x.size());check(cudaMemcpy(ptr,x.data(),x.size()*sizeof(T),cudaMemcpyHostToDevice),"setup upload");}
 };
+
+#ifndef FHERMA_TENSOR_CRT
+#define FHERMA_TENSOR_CRT 1
+#endif
+
+#if FHERMA_TENSOR_CRT
+namespace fherma_tensor_crt {
+using namespace ari_wmma_encoder;
+constexpr unsigned rows = 16;
+constexpr unsigned max_pitch = 128;
+constexpr unsigned max_limbs = 64;
+
+__global__ void reconstruct(fherma_crt::DeviceArgs plan,
+                            const std::uint8_t* weights,
+                            const std::uint32_t* residues, std::uint32_t* output) {
+    __shared__ __align__(32) std::uint8_t packed[4 * rows * max_pitch];
+    __shared__ std::uint32_t terms[max_pitch][rows];
+    __shared__ __align__(32) int columns[3][max_limbs * rows];
+
+    const unsigned thread = threadIdx.x;
+    const unsigned warp = thread / 32;
+    const unsigned first = blockIdx.x * rows;
+    const unsigned pitch = round16(plan.count + 1);
+    for (unsigned i = thread; i < plan.count * rows; i += blockDim.x) {
+        const unsigned prime = i / rows;
+        const unsigned row = i % rows;
+        const unsigned coefficient = first + row;
+        const auto residue = coefficient < plan.n
+            ? residues[std::size_t(prime) * plan.n + coefficient] : 0u;
+        terms[prime][row] = fherma_crt::weight_residue(residue, plan.primes[prime]);
+    }
+    __syncthreads();
+    if (thread < rows) {
+        terms[plan.count][thread] = fherma_crt::correction<rows>(
+            &terms[0][thread], plan.primes, plan.count);
+    }
+    __syncthreads();
+    for (unsigned i = thread; i < pitch * rows; i += blockDim.x) {
+        const unsigned row = i / pitch;
+        const unsigned prime = i % pitch;
+        const auto value = prime <= plan.count ? terms[prime][row] : 0u;
+        #pragma unroll
+        for (unsigned byte = 0; byte < 4; ++byte)
+            packed[word_offset(byte, row, prime, rows, pitch)] = std::uint8_t(value >> (8 * byte));
+    }
+    __syncthreads();
+
+    const unsigned limb = warp * rows;
+    if (limb < plan.limbs) {
+        const unsigned padded_limbs = round16(plan.limbs);
+        EncAcc diagonal[7];
+        #pragma unroll
+        for (unsigned d = 0; d < 7; ++d) wmma::fill_fragment(diagonal[d], 0);
+        for (unsigned prime = 0; prime < pitch; prime += rows) {
+            EncA a[4];
+            EncB b[4];
+            #pragma unroll
+            for (unsigned byte = 0; byte < 4; ++byte) {
+                wmma::load_matrix_sync(a[byte], packed + word_offset(byte, 0, prime, rows, pitch), rows);
+                wmma::load_matrix_sync(b[byte], weights + word_offset(byte, limb, prime, padded_limbs, pitch), rows);
+            }
+            // Each diagonal is bounded by 4 * 128 * 255^2, well below INT32_MAX.
+            #pragma unroll
+            for (unsigned u = 0; u < 4; ++u) {
+                #pragma unroll
+                for (unsigned v = 0; v < 4; ++v)
+                    wmma::mma_sync(diagonal[u + v], a[u], b[v], diagonal[u + v]);
+            }
+        }
+        #pragma unroll
+        for (int element = 0; element < EncAcc::num_elements; ++element) {
+            const auto words = split_words(diagonal[0].x[element], diagonal[1].x[element],
+                diagonal[2].x[element], diagonal[3].x[element], diagonal[4].x[element],
+                diagonal[5].x[element], diagonal[6].x[element]);
+            diagonal[0].x[element] = static_cast<int>(words.s0);
+            diagonal[1].x[element] = static_cast<int>(words.s1);
+            diagonal[2].x[element] = static_cast<int>(words.s2);
+        }
+        #pragma unroll
+        for (unsigned word = 0; word < 3; ++word)
+            wmma::store_matrix_sync(columns[word] + limb * rows, diagonal[word], rows, wmma::mem_col_major);
+    }
+    __syncthreads();
+
+    if (thread < rows && first + thread < plan.n) {
+        std::uint32_t digits[max_limbs + 2];
+        std::uint64_t carry = 0;
+        std::uint64_t previous_high = 0;
+        for (unsigned i = 0; i < plan.limbs; ++i) {
+            const unsigned index = i * rows + thread;
+            carry += std::uint32_t(columns[0][index]) + previous_high;
+            digits[i] = std::uint32_t(carry);
+            carry >>= 32;
+            previous_high = std::uint32_t(columns[1][index])
+                | (std::uint64_t(std::uint32_t(columns[2][index])) << 32);
+        }
+        carry += previous_high;
+        digits[plan.limbs] = std::uint32_t(carry);
+        digits[plan.limbs + 1] = std::uint32_t(carry >> 32);
+        fherma_crt::reduce_sum<1>(digits, plan.limbs, plan.bits, plan.gap, plan.q);
+        for (unsigned i = 0; i < plan.limbs; ++i)
+            output[std::size_t(first + thread) * plan.limbs + i] = digits[i];
+    }
+}
+
+class Plan {
+    fherma_crt::DeviceArgs args_{};
+    Buffer<fherma_crt::PrimeInfo> primes_;
+    Buffer<std::uint32_t> modulus_;
+    Buffer<std::uint8_t> weights_;
+public:
+    Plan(unsigned n, const std::uint32_t* q, unsigned limbs, const std::vector<std::uint32_t>& primes) {
+        const auto host = fherma_crt::make_plan(n, q, limbs, primes);
+        const unsigned count = unsigned(primes.size());
+        const unsigned pitch = round16(count + 1);
+        const unsigned padded_limbs = round16(limbs);
+        std::vector<std::uint8_t> packed(4 * padded_limbs * pitch);
+        for (unsigned limb = 0; limb < limbs; ++limb) {
+            for (unsigned prime = 0; prime <= count; ++prime) {
+                const auto word = host.weights[std::size_t(limb) * (count + 1) + prime];
+                for (unsigned byte = 0; byte < 4; ++byte)
+                    packed[word_offset(byte, limb, prime, padded_limbs, pitch)] = std::uint8_t(word >> (8 * byte));
+            }
+        }
+        primes_.copy(host.primes);
+        modulus_.copy(host.q);
+        weights_.copy(packed);
+        args_ = {n, limbs, host.bits, count, host.gap, primes_.ptr, nullptr, modulus_.ptr};
+    }
+
+    cudaError_t run(const std::uint32_t* residues, std::uint32_t* out) const {
+        reconstruct<<<(args_.n + rows - 1) / rows, 128>>>(args_, weights_.ptr, residues, out);
+        return cudaGetLastError();
+    }
+};
+} // namespace fherma_tensor_crt
+#endif
+
 // Persistent page-locked staging belongs exclusively to State. Every copy of
 // operand/result bytes still occurs inside the measured fherma_run call.
 template<class T> struct HostBuffer {
@@ -1136,6 +1274,9 @@ struct State {
     HostBuffer<uint32_t> host_c;
 #endif
     std::unique_ptr<fherma_crt::DevicePlan> crt;
+#if FHERMA_TENSOR_CRT
+    std::unique_ptr<fherma_tensor_crt::Plan> tensor_crt;
+#endif
     explicit State(const fherma::Point& p):plan(p){}
 };
 // Calibration touches only owned, synthetic point-sized storage. All runtime
@@ -1228,7 +1369,12 @@ void* fherma_init(const fherma::Point& p) {
     s->primes.copy(s->plan.primes);s->roots.copy(s->plan.roots);
     s->inverse_roots.copy(s->plan.inverse_roots);s->twist.copy(ari_shoup::reorder_twists(s->plan.twist,p.N,s->plan.logN));s->untwist.copy(s->plan.untwist);
     std::vector<uint32_t> primes;for(auto prime:s->plan.primes)primes.push_back(prime.p);
-    s->crt=std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes);
+#if FHERMA_TENSOR_CRT
+    if (p.L <= fherma_tensor_crt::max_limbs && primes.size() < fherma_tensor_crt::max_pitch)
+        s->tensor_crt = std::make_unique<fherma_tensor_crt::Plan>(p.N,p.q.data.data(),p.L,primes);
+    else
+#endif
+        s->crt = std::make_unique<fherma_crt::DevicePlan>(p.N,p.q.data.data(),p.L,primes);
     check(cudaDeviceSynchronize(),"initialize GPU");
     choose_staging(*s,words);
     return s.release();
@@ -1283,7 +1429,12 @@ fherma::Outputs fherma_run(void* state,const fherma::Inputs& in) {
 #endif
     decode<<<grid,256>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
     check(cudaGetLastError(),"decode launch");
-    check(s.crt->run(s.rc.ptr,s.c.ptr),"CRT launch");
+#if FHERMA_TENSOR_CRT
+    if (s.tensor_crt)
+        check(s.tensor_crt->run(s.rc.ptr,s.c.ptr),"Tensor Core CRT launch");
+    else
+#endif
+        check(s.crt->run(s.rc.ptr,s.c.ptr),"CRT launch");
     fherma::Outputs out;out.c.shape={int64_t(p.N),int64_t(p.L)};
 #if FHERMA_PINNED_OUTPUT
     check(cudaMemcpyAsync(s.host_c.ptr,s.c.ptr,bytes,cudaMemcpyDeviceToHost,nullptr),"download staged result");
