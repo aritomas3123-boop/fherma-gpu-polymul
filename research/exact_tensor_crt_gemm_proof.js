@@ -26,6 +26,23 @@ function exactInt8TensorAlgebra(terms,weights,row,col){
  }
  return acc;
 }
+function exactKernelSevenDiagonal(terms,weights,row,col){
+ const D=new Uint32Array(7);
+ for(let j=0;j<P;j++){
+  const a=terms[row*P+j],b=weights[j*L+col];
+  for(let u=0;u<4;u++)for(let v=0;v<4;v++)
+   D[u+v]+=((a>>>(u*8))&255)*((b>>>(v*8))&255);
+ }
+ let carry=0n,words=[0n,0n,0n];
+ for(let d=0;d<7;d++){
+  carry+=BigInt(D[d]);
+  words[Math.floor(d/4)]|=(carry&255n)<<BigInt(8*(d%4));
+  carry>>=8n;
+ }
+ words[1]|=(carry&255n)<<24n;
+ words[2]=carry>>8n;
+ return words[0]+(words[1]<<32n)+(words[2]<<64n);
+}
 const modes=["zero","maximum","alternating","random","highbits","lowbits"];
 let checks=0;
 for(const mode of modes){
@@ -39,6 +56,7 @@ for(const mode of modes){
  for(let row=0;row<ROWS;row++)for(let col=0;col<L;col++){
    const a=exactScalar(t,w,row,col),b=exactInt8TensorAlgebra(t,w,row,col);
    assert.equal(a,b,"CRT GEMM mismatch");
+   assert.equal(a,exactKernelSevenDiagonal(t,w,row,col),"seven-diagonal CUDA reconstruction mismatch");
    assert(a < (1n<<72n),"CRT sum overflow > 72 bits");
    checks++;
  }
