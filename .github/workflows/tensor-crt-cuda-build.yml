@@ -1,5 +1,7 @@
 name: Verify Tensor-CRT 12.8 Blackwell build (no GPU)
 on:
+  pull_request:
+    branches: [main]
   push:
     branches: [experiment-exact-tensor-crt-20261111]
   workflow_dispatch:
