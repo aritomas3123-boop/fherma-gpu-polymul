@@ -1,0 +1,30 @@
+name: Verify Tensor-CRT 12.8 Blackwell build (no GPU)
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [experiment-exact-tensor-crt-20261111]
+  workflow_dispatch:
+jobs:
+  cuda:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    container:
+      image: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        tensor_crt: [ON, OFF]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install compilers and Node.js
+        run: |
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cmake make g++ nodejs
+      - name: Check scalar-to-INT8 exact arithmetic
+        run: node research/exact_tensor_crt_gemm_proof.js
+      - name: CUDA architecture sm_120 compile
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DFHERMA_CUDA_ARCH=sm_120 -DFHERMA_TENSOR_CRT=${{ matrix.tensor_crt }}
+          cmake --build build -j 2
+          ls -lh build/solution
