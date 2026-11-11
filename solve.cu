@@ -1119,6 +1119,18 @@ __global__ void decode(uint32_t* a,const ari::Prime* primes,const uint32_t* untw
     const size_t at=size_t(k)*N+i;const auto p=primes[k];
     a[at]=ari::mont(ari::mont(a[at],untwist[at],p),1,p);
 }
+struct BatchDownload {
+    Buffer<uint32_t> second_device;
+    HostBuffer<uint32_t> second_host;
+    OperandStream stream;
+    ForwardReady upload_a, upload_b, computed, downloaded[2];
+
+    explicit BatchDownload(size_t words) {
+        second_device.alloc(words);
+        second_host.alloc(words);
+    }
+};
+
 struct State {
     ari::Plan plan;
     OperandStream stream_a;
@@ -1136,6 +1148,7 @@ struct State {
     HostBuffer<uint32_t> host_c;
 #endif
     std::unique_ptr<fherma_crt::DevicePlan> crt;
+    std::unique_ptr<BatchDownload> batch_download;
     explicit State(const fherma::Point& p):plan(p){}
 };
 // Calibration touches only owned, synthetic point-sized storage. All runtime
@@ -1234,10 +1247,10 @@ void* fherma_init(const fherma::Point& p) {
     return s.release();
 }
 
-static void multiply_pair(State& s, const uint32_t* a, const uint32_t* b, uint32_t* output) {
+static void enqueue_pair(State& s, const uint32_t* a, const uint32_t* b,
+                         uint32_t* device_output, BatchDownload* batch) {
     const auto& p=s.plan;
     const size_t words=size_t(p.N)*p.L,bytes=words*sizeof(uint32_t);
-    RunFence fence(s.stream_a.handle);
     const dim3 grid((p.N+255)/256,p.K);
 #if !FHERMA_NTT_TILED
     const dim3 butterflies((p.N/2+255)/256,p.K);
@@ -1251,6 +1264,10 @@ static void multiply_pair(State& s, const uint32_t* a, const uint32_t* b, uint32
         input=stage;
 #endif
         check(cudaMemcpyAsync(device,input,bytes,cudaMemcpyHostToDevice,stream),"upload operand");
+        if (batch) {
+            auto upload = operand ? batch->upload_b.handle : batch->upload_a.handle;
+            check(cudaEventRecord(upload, stream), "record input upload");
+        }
         check(ari_wmma_encoder::launch_operand(device,residues,operand,s.packed_inputs.ptr,
             s.packed_weights.ptr,s.primes.ptr,s.radix.ptr,s.twist.ptr,
             p.N,p.L,p.logN,p.K,stream),"encode operand");
@@ -1282,15 +1299,75 @@ static void multiply_pair(State& s, const uint32_t* a, const uint32_t* b, uint32
 #endif
     decode<<<grid,256>>>(s.rc.ptr,s.primes.ptr,s.untwist.ptr,p.N);
     check(cudaGetLastError(),"decode launch");
-    check(s.crt->run(s.rc.ptr,s.c.ptr),"CRT launch");
-#if FHERMA_PINNED_OUTPUT
-    check(cudaMemcpyAsync(s.host_c.ptr,s.c.ptr,bytes,cudaMemcpyDeviceToHost,nullptr),"download staged result");
+    check(s.crt->run(s.rc.ptr,device_output),"CRT launch");
+}
+
+static void multiply_pair(State& s, const uint32_t* a, const uint32_t* b,
+                          uint32_t* output, size_t words) {
+    RunFence fence(s.stream_a.handle);
+    enqueue_pair(s, a, b, s.c.ptr, nullptr);
+    check(cudaMemcpyAsync(s.host_c.ptr, s.c.ptr, words * sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost, nullptr), "download staged result");
     fence.complete();
-    s.copy_team->copy(output,s.host_c.ptr,words);
-#else
-    check(cudaMemcpy(output,s.c.ptr,bytes,cudaMemcpyDeviceToHost),"download result");
-    fence.complete();
-#endif
+    s.copy_team->copy(output, s.host_c.ptr, words);
+}
+
+// Drain all three streams on an error before returning buffers to the caller.
+struct BatchFence {
+    cudaStream_t upload;
+    cudaStream_t download;
+    bool complete = false;
+    ~BatchFence() {
+        if (!complete) {
+            cudaStreamSynchronize(upload);
+            cudaStreamSynchronize(nullptr);
+            cudaStreamSynchronize(download);
+        }
+    }
+};
+
+static void multiply_batch(State& s, const uint32_t* a, const uint32_t* b,
+                           uint32_t* output, size_t batch_size, size_t words) {
+    if (!s.batch_download)
+        s.batch_download = std::make_unique<BatchDownload>(words);
+    auto& batch = *s.batch_download;
+    const auto download = batch.stream.handle;
+    BatchFence fence{s.stream_a.handle, download};
+    uint32_t* const device_slots[] = {s.c.ptr, batch.second_device.ptr};
+    uint32_t* const host_slots[] = {s.host_c.ptr, batch.second_host.ptr};
+    const size_t bytes = words * sizeof(uint32_t);
+
+    auto consume = [&](size_t index) {
+        const auto slot = index % 2;
+        check(cudaEventSynchronize(batch.downloaded[slot].handle), "wait for output slot");
+        s.copy_team->copy(output + index * words, host_slots[slot], words);
+    };
+
+    for (size_t index = 0; index < batch_size; ++index) {
+        const auto slot = index % 2;
+        if (index >= 2)
+            consume(index - 2);
+        if (index) {
+            // A uses a nonblocking stream and must wait before reusing scratch.
+            check(cudaStreamWaitEvent(s.stream_a.handle, batch.computed.handle, 0),
+                  "wait before reusing A scratch");
+            // Only the upload DMA must finish before the CPU rewrites staging.
+            check(cudaEventSynchronize(batch.upload_a.handle), "wait before staging A");
+            check(cudaEventSynchronize(batch.upload_b.handle), "wait before staging B");
+        }
+        enqueue_pair(s, a + index * words, b + index * words, device_slots[slot], &batch);
+        check(cudaEventRecord(batch.computed.handle, nullptr), "record completed CRT");
+        check(cudaStreamWaitEvent(download, batch.computed.handle, 0), "wait for CRT on download stream");
+        check(cudaMemcpyAsync(host_slots[slot], device_slots[slot], bytes,
+                              cudaMemcpyDeviceToHost, download), "download batch output");
+        check(cudaEventRecord(batch.downloaded[slot].handle, download), "record completed download");
+    }
+    consume(batch_size - 2);
+    consume(batch_size - 1);
+    check(cudaStreamSynchronize(s.stream_a.handle), "check batch A stream completion");
+    check(cudaStreamSynchronize(nullptr), "check batch compute completion");
+    check(cudaStreamSynchronize(download), "check batch download completion");
+    fence.complete = true;
 }
 
 fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
@@ -1313,9 +1390,10 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     fherma::Outputs out;
     out.c.shape = shape;
     out.c.data.resize(in.a.data.size());
-    for (size_t offset = 0; offset < out.c.data.size(); offset += words)
-        multiply_pair(s, in.a.data.data() + offset, in.b.data.data() + offset,
-                      out.c.data.data() + offset);
+    if (batch == 1)
+        multiply_pair(s, in.a.data.data(), in.b.data.data(), out.c.data.data(), words);
+    else
+        multiply_batch(s, in.a.data.data(), in.b.data.data(), out.c.data.data(), batch, words);
     return out;
 }
 void fherma_free(void* state) {delete static_cast<State*>(state);}
