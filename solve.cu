@@ -1040,6 +1040,10 @@ public:
 #include <chrono>
 #include <cstdio>
 #include <system_error>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 void check(cudaError_t e,const char* where) {
@@ -1371,6 +1375,24 @@ static void multiply_batch(State& s, const uint32_t* a, const uint32_t* b,
     fence.complete = true;
 }
 
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+static void advise_large_output(std::vector<uint32_t>& output, size_t words) {
+    const size_t bytes = words * sizeof(uint32_t);
+    if (bytes < (32u << 20) || !output.data())
+        return;
+    const long system_page = sysconf(_SC_PAGESIZE);
+    if (system_page <= 0)
+        return;
+    const auto page = size_t(system_page);
+    const auto address = reinterpret_cast<std::uintptr_t>(output.data());
+    const auto first = (address + page - 1) / page * page;
+    const auto last = (address + bytes) / page * page;
+    // Advise only whole pages inside this allocation, without touching contents.
+    if (last > first)
+        (void)madvise(reinterpret_cast<void*>(first), last - first, MADV_HUGEPAGE);
+}
+#endif
+
 fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
     auto& s = *static_cast<State*>(state);
     const auto& p = s.plan;
@@ -1395,6 +1417,9 @@ fherma::Outputs fherma_run(void* state, const fherma::Inputs& in) {
         multiply_pair(s, in.a.data.data(), in.b.data.data(), out.c.data.data(), words);
     } else {
         out.c.data.reserve(in.a.data.size());
+#if defined(__linux__) && defined(MADV_HUGEPAGE)
+        advise_large_output(out.c.data, in.a.data.size());
+#endif
         multiply_batch(s, in.a.data.data(), in.b.data.data(), out.c.data, batch, words);
     }
     return out;
